@@ -6,3 +6,11 @@ __pycache__
 
 .env
 ./env
+
+creds/
+./creds/
+.DS_Store
+./DS_Store
+
+./.cursorrules
+.cursorrules
