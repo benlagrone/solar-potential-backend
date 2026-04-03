@@ -32,7 +32,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     env:
-      IMAGE_REF: ghcr.io/benlagrone/solar-potential-backend
+      IMAGE_REF: ghcr.io/benlagrone/solar-potential-api
       SOURCE_SHA: ${{ github.sha }}
       DEPLOY_ENVIRONMENT: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_environment || 'prod' }}
       SHOULD_DISPATCH_RAW: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_fortress || 'true' }}
@@ -58,8 +58,8 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/benlagrone/solar-potential-backend:sha-${{ github.sha }}
-            ghcr.io/benlagrone/solar-potential-backend:latest
+            ghcr.io/benlagrone/solar-potential-api:sha-${{ github.sha }}
+            ghcr.io/benlagrone/solar-potential-api:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
