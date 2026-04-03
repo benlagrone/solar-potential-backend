@@ -1,5 +1,7 @@
 venv
 ./venv
+.venv
+./.venv
 
 __pycache__
 ./__pycache__
@@ -14,3 +16,6 @@ creds/
 
 ./.cursorrules
 .cursorrules
+
+.runtime/
+*.sqlite3

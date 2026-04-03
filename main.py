@@ -1,26 +1,35 @@
-import json
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import os
 import logging
+import os
 from data_persistence import (
     store_personal_info, store_browser_data, store_solar_data,
-    check_existing_address_data, check_existing_solar_data, check_existing_zip_data
+    check_existing_address_data, check_existing_solar_data, check_existing_zip_data,
+    find_property_record_by_address, find_solar_quote, get_property_record, list_property_records,
+    upsert_property_record,
+    build_address_lookup_key, build_coordinate_lookup_key, get_geocode_cache, store_geocode_cache,
 )
-from google_sheets_service import GoogleSheetsService
+from property_context import get_property_context_snapshot
+from live_conditions import (
+    get_property_climate_snapshot,
+    get_space_weather_snapshot,
+    get_surface_irradiance_snapshot,
+)
 import uuid
 from geopy.geocoders import Nominatim
 from datetime import datetime, timedelta
 import requests
-from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 import ssl
 import certifi
 from timezonefinder import TimezoneFinder
+import re
+from types import SimpleNamespace
+from typing import Optional
 
 load_dotenv()
 
@@ -34,9 +43,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Initialize Google Sheets service
-sheets_service = GoogleSheetsService()
 
 # Models
 class Address(BaseModel):
@@ -58,34 +64,840 @@ class UserData(BaseModel):
     address: Address
     browserData: BrowserData
 
+class RoofSelection(BaseModel):
+    geometry: dict
+    centroid: Optional[dict] = None
+    areaSquareMeters: float
+    areaSquareFeet: float
+    recommendedKw: float
+
+
+class GardenZone(BaseModel):
+    id: str
+    name: str
+    geometry: dict
+    centroid: Optional[dict] = None
+    areaSquareMeters: float
+    areaSquareFeet: float
+
+
+class PreviewBounds(BaseModel):
+    south: float
+    north: float
+    west: float
+    east: float
+
+
+class PropertyRecordRequest(BaseModel):
+    guid: Optional[str] = None
+    address: Address
+    property_preview: Optional[dict] = None
+    property_context: Optional[dict] = None
+    roof_selection: Optional[RoofSelection] = None
+    garden_zones: Optional[list[GardenZone]] = None
+
+
+class PropertyRecordRecentRequest(BaseModel):
+    max_items: int = 8
+    require_garden_zones: bool = False
+
+
 class SolarPotentialRequest(BaseModel):
     guid: str
-    system_size: float = 7.0  # in kW, default 7kW
+    system_size: Optional[float] = 7.0  # retained for backward compatibility
     panel_efficiency: float = 0.20  # default 20%
     electricity_rate: float  # in $/kWh
     installation_cost_per_watt: float = 3.0  # in $/W, default $3/W
+    roof_selection: Optional[RoofSelection] = None
+
+
+class SolarReportRequest(BaseModel):
+    guid: str
+    panel_efficiency: float = 0.20
+    electricity_rate: float
+    installation_cost_per_watt: float = 3.0
+    roof_selection: Optional[RoofSelection] = None
+    report_name: Optional[str] = None
+
+
+class SolarQuoteRequest(BaseModel):
+    guid: str
+    report_id: str
+
+
+class Coordinates(BaseModel):
+    latitude: float
+    longitude: float
+
+
+class PropertyContextRequest(BaseModel):
+    latitude: float
+    longitude: float
+    bounds: Optional[PreviewBounds] = None
+    match_quality: Optional[str] = None
 
 # Create a custom SSL context
 ctx = ssl.create_default_context(cafile=certifi.where())
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
 
-geolocator = Nominatim(user_agent="solar_potential_app", ssl_context=ctx)
 
-import json
-import requests
-import logging
-from fastapi import HTTPException
-from datetime import datetime, timedelta
+def build_nominatim_geolocator():
+    return Nominatim(
+        user_agent=os.getenv("GEOCODER_USER_AGENT", "solar_potential_app"),
+        domain=os.getenv("GEOCODER_NOMINATIM_DOMAIN", "nominatim.openstreetmap.org"),
+        scheme=os.getenv("GEOCODER_NOMINATIM_SCHEME", "https"),
+        ssl_context=ctx,
+    )
 
-logger = logging.getLogger(__name__)
 
-import requests
-import logging
-from fastapi import HTTPException
-from datetime import datetime, timedelta
+geolocator = build_nominatim_geolocator()
 
 logger = logging.getLogger(__name__)
+ARCGIS_GEOCODE_URL = (
+    "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates"
+)
+ARCGIS_REVERSE_GEOCODE_URL = (
+    "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/reverseGeocode"
+)
+MONTH_DAY_COUNTS = {
+    "01": 31,
+    "02": 28,
+    "03": 31,
+    "04": 30,
+    "05": 31,
+    "06": 30,
+    "07": 31,
+    "08": 31,
+    "09": 30,
+    "10": 31,
+    "11": 30,
+    "12": 31,
+}
+ROOF_COVERAGE_FACTOR = 0.565
+NREL_PVWATTS_URL = os.getenv(
+    "NREL_PVWATTS_URL",
+    "https://developer.nlr.gov/api/pvwatts/v8.json",
+)
+NREL_PVWATTS_REFERENCE_SYSTEM_KW = 1.0
+NREL_PVWATTS_DEFAULT_LOSSES = 14.0
+NREL_PVWATTS_DEFAULT_ARRAY_TYPE = 1
+NREL_PVWATTS_DEFAULT_MODULE_TYPE = 0
+NREL_PVWATTS_DEFAULT_AZIMUTH = 180.0
+NREL_PVWATTS_DEFAULT_INV_EFFICIENCY = 96.0
+NREL_PVWATTS_DEFAULT_DATASET = "nsrdb"
+NREL_PVWATTS_DEFAULT_RADIUS = 0
+FORWARD_PROPERTY_PREVIEW_CACHE = "forward-property-preview"
+REVERSE_PROPERTY_PREVIEW_CACHE = "reverse-property-preview"
+
+
+def normalize_quality_percent(value):
+    if value is None:
+        return 0
+    return round(value if value <= 100 else 100, 2)
+
+
+def get_nrel_api_key():
+    return os.getenv("NREL_API_KEY")
+
+
+def month_key(index):
+    return str(index).zfill(2)
+
+
+def month_dict_from_sequence(values, digits=2):
+    return {
+        month_key(index + 1): round(float(value or 0), digits)
+        for index, value in enumerate(values[:12])
+    }
+
+
+def estimate_pvwatts_tilt(latitude):
+    return round(clamp(abs(float(latitude)), 10.0, 40.0), 1)
+
+
+def resolve_solar_provider(solar_data):
+    return (solar_data or {}).get("provider") or "nasa"
+
+
+def get_geocoder_provider():
+    provider = normalize_lookup_text(os.getenv("GEOCODER_PROVIDER", "hybrid"))
+    return provider or "hybrid"
+
+
+def format_address(address):
+    region = " ".join(part for part in [address.get("state", ""), address.get("zip", "")] if part)
+    parts = [
+        address.get("street", ""),
+        address.get("city", ""),
+        region,
+        address.get("country", ""),
+    ]
+    return ", ".join(part for part in parts if part)
+
+
+def normalize_lookup_text(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+
+STREET_ABBREVIATIONS = {
+    "aly": "alley",
+    "ave": "avenue",
+    "blvd": "boulevard",
+    "cir": "circle",
+    "ct": "court",
+    "dr": "drive",
+    "hwy": "highway",
+    "ln": "lane",
+    "pkwy": "parkway",
+    "pl": "place",
+    "rd": "road",
+    "sq": "square",
+    "st": "street",
+    "ter": "terrace",
+    "trl": "trail",
+    "way": "way",
+}
+
+
+def normalize_lookup_tokens(value):
+    return [
+        STREET_ABBREVIATIONS.get(token, token)
+        for token in normalize_lookup_text(value).split()
+        if token
+    ]
+
+
+def normalize_street_text(value):
+    return " ".join(normalize_lookup_tokens(value))
+
+
+def extract_house_number(value):
+    tokens = normalize_lookup_tokens(value)
+
+    if tokens and tokens[0].isdigit():
+        return tokens[0]
+
+    return ""
+
+
+def extract_street_name(value):
+    tokens = normalize_lookup_tokens(value)
+
+    if tokens and tokens[0].isdigit():
+        tokens = tokens[1:]
+
+    return " ".join(tokens)
+
+
+def get_country_code(country_name):
+    normalized = normalize_lookup_text(country_name)
+
+    if normalized in {"united states", "usa", "us"}:
+        return "us"
+
+    return None
+
+
+def build_structured_query(address):
+    return {
+        "street": address.get("street", ""),
+        "city": address.get("city", ""),
+        "state": address.get("state", ""),
+        "postalcode": address.get("zip", ""),
+        "country": address.get("country", ""),
+    }
+
+
+def score_geocode_candidate(address, location):
+    raw_address = getattr(location, "raw", {}).get("address", {}) or {}
+    candidate_address = extract_address_parts(raw_address)
+    return score_address_match(address, candidate_address, location.address or "")
+
+
+def assess_match_quality(score):
+    if score >= 26:
+        return "high"
+    if score >= 16:
+        return "medium"
+    return "low"
+
+
+def parse_bounding_box(location):
+    raw_location = getattr(location, "raw", {}) or {}
+    bounding_box = raw_location.get("boundingbox")
+
+    if not bounding_box or len(bounding_box) != 4:
+        return None
+
+    south, north, west, east = [round(float(value), 6) for value in bounding_box]
+
+    return {
+        "south": south,
+        "north": north,
+        "west": west,
+        "east": east,
+    }
+
+
+def get_state_value(raw_address):
+    iso_subdivision = raw_address.get("ISO3166-2-lvl4", "")
+
+    if iso_subdivision.startswith("US-"):
+        return iso_subdivision.split("-", 1)[1]
+
+    return raw_address.get("state", "")
+
+
+def extract_address_parts(raw_address):
+    house_number = raw_address.get("house_number", "").strip()
+    road = (
+        raw_address.get("road")
+        or raw_address.get("pedestrian")
+        or raw_address.get("footway")
+        or raw_address.get("residential")
+        or ""
+    ).strip()
+    street = " ".join(part for part in [house_number, road] if part).strip()
+    city = (
+        raw_address.get("city")
+        or raw_address.get("town")
+        or raw_address.get("village")
+        or raw_address.get("hamlet")
+        or raw_address.get("municipality")
+        or raw_address.get("county")
+        or ""
+    )
+
+    return {
+        "street": street,
+        "city": city,
+        "state": get_state_value(raw_address),
+        "zip": raw_address.get("postcode", ""),
+        "country": raw_address.get("country", ""),
+    }
+
+
+def extract_arcgis_address_parts(raw_address):
+    return {
+        "street": raw_address.get("Address") or raw_address.get("ShortLabel") or "",
+        "city": raw_address.get("City", ""),
+        "state": raw_address.get("RegionAbbr", "") or raw_address.get("Region", ""),
+        "zip": raw_address.get("Postal", ""),
+        "country": raw_address.get("CntryName", "") or raw_address.get("CountryCode", ""),
+    }
+
+
+def score_address_match(requested_address, candidate_address, display_text=""):
+    normalized_requested_street = normalize_street_text(requested_address.get("street", ""))
+    normalized_candidate_street = normalize_street_text(candidate_address.get("street", ""))
+    normalized_requested_street_name = extract_street_name(requested_address.get("street", ""))
+    normalized_candidate_street_name = extract_street_name(candidate_address.get("street", ""))
+    normalized_requested_city = normalize_lookup_text(requested_address.get("city", ""))
+    normalized_candidate_city = normalize_lookup_text(candidate_address.get("city", ""))
+    normalized_requested_state = normalize_lookup_text(requested_address.get("state", ""))
+    normalized_candidate_state = normalize_lookup_text(candidate_address.get("state", ""))
+    normalized_requested_zip = normalize_lookup_text(requested_address.get("zip", ""))
+    normalized_candidate_zip = normalize_lookup_text(candidate_address.get("zip", ""))
+    normalized_requested_country = normalize_lookup_text(requested_address.get("country", ""))
+    normalized_candidate_country = normalize_lookup_text(candidate_address.get("country", ""))
+    normalized_display = normalize_lookup_text(display_text)
+    requested_house_number = extract_house_number(requested_address.get("street", ""))
+    candidate_house_number = extract_house_number(candidate_address.get("street", ""))
+
+    score = 0
+
+    if requested_house_number and candidate_house_number:
+        if requested_house_number == candidate_house_number:
+            score += 8
+        else:
+            score -= 6
+
+    if normalized_requested_zip and normalized_candidate_zip:
+        if normalized_requested_zip == normalized_candidate_zip:
+            score += 4
+        else:
+            score -= 4
+
+    if normalized_requested_city and normalized_candidate_city:
+        if normalized_requested_city in normalized_candidate_city:
+            score += 3
+        else:
+            score -= 2
+
+    if normalized_requested_state and normalized_candidate_state:
+        if normalized_requested_state in normalized_candidate_state:
+            score += 2
+        else:
+            score -= 2
+
+    if normalized_requested_country and normalized_candidate_country:
+        if normalized_requested_country in normalized_candidate_country:
+            score += 1
+        else:
+            score -= 1
+
+    if normalized_requested_street_name and normalized_candidate_street_name:
+        if normalized_requested_street_name == normalized_candidate_street_name:
+            score += 6
+        else:
+            requested_tokens = set(normalized_requested_street_name.split())
+            candidate_tokens = set(normalized_candidate_street_name.split())
+            overlap_count = len(requested_tokens & candidate_tokens)
+            if overlap_count:
+                score += min(overlap_count, 3)
+            else:
+                score -= 3
+
+    if normalized_requested_street and normalized_requested_street in normalized_display:
+        score += 2
+
+    return score
+
+
+def score_location_precision(location):
+    raw_location = getattr(location, "raw", {}) or {}
+    raw_address = raw_location.get("address", {}) or {}
+    addresstype = normalize_lookup_text(raw_location.get("addresstype", ""))
+    location_type = normalize_lookup_text(raw_location.get("type", ""))
+    location_class = normalize_lookup_text(raw_location.get("class", ""))
+    bounding_box = parse_bounding_box(location)
+    score = 0
+
+    if raw_address.get("house_number") and (
+        raw_address.get("road")
+        or raw_address.get("pedestrian")
+        or raw_address.get("footway")
+        or raw_address.get("residential")
+    ):
+        score += 4
+
+    if addresstype in {"house", "building", "residential", "commercial", "amenity"}:
+        score += 6
+    elif addresstype in {"road", "pedestrian", "footway", "path"}:
+        score -= 6
+
+    if location_type in {"house", "building"}:
+        score += 3
+    elif location_type in {"road", "pedestrian", "footway", "path"}:
+        score -= 4
+
+    if location_class == "building":
+        score += 2
+
+    if get_location_source(location) == "arcgis-pointaddress":
+        score += 6
+
+    if is_road_centerline_house_match(location):
+        score -= 6
+
+    if bounding_box:
+        max_span = max(
+            abs(bounding_box["north"] - bounding_box["south"]),
+            abs(bounding_box["east"] - bounding_box["west"]),
+        )
+        if max_span <= 0.0006:
+            score += 5
+        elif max_span <= 0.0015:
+            score += 2
+        elif max_span >= 0.004:
+            score -= 4
+
+    return score
+
+
+def score_reverse_geocode_candidate(address, location):
+    try:
+        if is_arcgis_location(location):
+            reverse_payload = reverse_geocode_arcgis_location(location.latitude, location.longitude)
+            reverse_address = reverse_payload.get("address", {}) or {}
+            candidate_address = extract_arcgis_address_parts(reverse_address)
+            display_text = (
+                reverse_address.get("LongLabel")
+                or reverse_address.get("Match_addr")
+                or reverse_address.get("Address")
+                or ""
+            )
+            return score_address_match(address, candidate_address, display_text)
+
+        reverse_location = reverse_geocode_location(location.latitude, location.longitude)
+    except HTTPException as exc:
+        logger.warning("Skipping reverse geocode validation for candidate: %s", exc.detail)
+        return 0
+    except Exception as exc:
+        logger.warning("Skipping reverse geocode validation for candidate: %s", str(exc))
+        return 0
+
+    raw_address = getattr(reverse_location, "raw", {}).get("address", {}) or {}
+    candidate_address = extract_address_parts(raw_address)
+    return score_address_match(address, candidate_address, reverse_location.address or "")
+
+
+def unique_geocode_key(location):
+    raw_location = getattr(location, "raw", {}) or {}
+    osm_type = raw_location.get("osm_type")
+    osm_id = raw_location.get("osm_id")
+
+    if osm_type and osm_id:
+        return f"{osm_type}:{osm_id}"
+
+    return (
+        round(float(location.latitude), 6),
+        round(float(location.longitude), 6),
+        normalize_lookup_text(location.address or ""),
+    )
+
+
+def dedupe_geocode_candidates(candidates):
+    seen = set()
+    unique_candidates = []
+
+    for location in candidates:
+        key = unique_geocode_key(location)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_candidates.append(location)
+
+    return unique_candidates
+
+
+def build_bounding_box_from_extent(extent):
+    if not extent:
+        return None
+
+    xmin = extent.get("xmin")
+    xmax = extent.get("xmax")
+    ymin = extent.get("ymin")
+    ymax = extent.get("ymax")
+
+    if None in {xmin, xmax, ymin, ymax}:
+        return None
+
+    return [str(ymin), str(ymax), str(xmin), str(xmax)]
+
+
+def build_location(address, latitude, longitude, raw):
+    return SimpleNamespace(
+        address=address,
+        latitude=float(latitude),
+        longitude=float(longitude),
+        raw=raw,
+    )
+
+
+def get_location_source(location):
+    raw_location = getattr(location, "raw", {}) or {}
+    return raw_location.get("source") or raw_location.get("provider") or "nominatim"
+
+
+def is_arcgis_location(location):
+    return "arcgis" in normalize_lookup_text(get_location_source(location))
+
+
+def is_road_centerline_house_match(location):
+    raw_location = getattr(location, "raw", {}) or {}
+
+    return (
+        raw_location.get("osm_type") == "way"
+        and raw_location.get("class") == "place"
+        and raw_location.get("type") == "house"
+        and raw_location.get("addresstype") == "place"
+    )
+
+
+def fetch_arcgis_point_address(address):
+    try:
+        response = requests.get(
+            ARCGIS_GEOCODE_URL,
+            params={
+                "SingleLine": format_address(address),
+                "f": "pjson",
+                "maxLocations": 1,
+                "outFields": "*",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as exc:
+        logger.warning("ArcGIS point-address fallback failed: %s", str(exc))
+        return None
+    except ValueError as exc:
+        logger.warning("ArcGIS point-address fallback returned invalid JSON: %s", str(exc))
+        return None
+
+    candidate = ((data or {}).get("candidates") or [None])[0]
+    if not candidate:
+        return None
+
+    attributes = candidate.get("attributes", {}) or {}
+    addr_type = attributes.get("Addr_type")
+    candidate_score = float(candidate.get("score") or attributes.get("Score") or 0)
+
+    if addr_type != "PointAddress" or candidate_score < 99:
+        return None
+
+    latitude = attributes.get("Y") or candidate.get("location", {}).get("y")
+    longitude = attributes.get("X") or candidate.get("location", {}).get("x")
+    if latitude is None or longitude is None:
+        return None
+
+    return build_location(
+        candidate.get("address") or format_address(address),
+        latitude,
+        longitude,
+        {
+            "provider": "arcgis",
+            "source": "arcgis-pointaddress",
+            "match_type": addr_type,
+            "score": candidate_score,
+            "boundingbox": build_bounding_box_from_extent(candidate.get("extent")),
+            "address": {
+                "house_number": attributes.get("AddNum", ""),
+                "road": " ".join(
+                    part
+                    for part in [
+                        attributes.get("StName", ""),
+                        attributes.get("StType", ""),
+                    ]
+                    if part
+                ).strip(),
+                "city": attributes.get("City", ""),
+                "state": attributes.get("RegionAbbr", "") or attributes.get("Region", ""),
+                "postcode": attributes.get("Postal", ""),
+                "country": attributes.get("CntryName", "") or attributes.get("Country", ""),
+            },
+            "raw_candidate": candidate,
+        },
+    )
+
+
+def fetch_arcgis_forward_candidates(address):
+    try:
+        response = requests.get(
+            ARCGIS_GEOCODE_URL,
+            params={
+                "SingleLine": format_address(address),
+                "f": "pjson",
+                "maxLocations": 5,
+                "outFields": "*",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as exc:
+        logger.warning("ArcGIS forward geocode failed: %s", str(exc))
+        return []
+    except ValueError as exc:
+        logger.warning("ArcGIS forward geocode returned invalid JSON: %s", str(exc))
+        return []
+
+    candidates = []
+    for candidate in (data.get("candidates") or []):
+        attributes = candidate.get("attributes", {}) or {}
+        latitude = attributes.get("Y") or candidate.get("location", {}).get("y")
+        longitude = attributes.get("X") or candidate.get("location", {}).get("x")
+        if latitude is None or longitude is None:
+            continue
+
+        candidates.append(
+            build_location(
+                candidate.get("address") or format_address(address),
+                latitude,
+                longitude,
+                {
+                    "provider": "arcgis",
+                    "source": "arcgis-forward",
+                    "match_type": attributes.get("Addr_type"),
+                    "score": float(candidate.get("score") or attributes.get("Score") or 0),
+                    "boundingbox": build_bounding_box_from_extent(candidate.get("extent")),
+                    "address": {
+                        "house_number": attributes.get("AddNum", ""),
+                        "road": " ".join(
+                            part
+                            for part in [
+                                attributes.get("StName", ""),
+                                attributes.get("StType", ""),
+                            ]
+                            if part
+                        ).strip(),
+                        "city": attributes.get("City", ""),
+                        "state": attributes.get("RegionAbbr", "") or attributes.get("Region", ""),
+                        "postcode": attributes.get("Postal", ""),
+                        "country": attributes.get("CntryName", "") or attributes.get("Country", ""),
+                    },
+                    "raw_candidate": candidate,
+                },
+            )
+        )
+
+    return candidates
+
+
+def fetch_nominatim_candidates(address):
+    structured_query = build_structured_query(address)
+    formatted_address = format_address(address)
+    country_code = get_country_code(address.get("country", ""))
+    queries = [structured_query, formatted_address]
+    candidates = []
+
+    for query in queries:
+        results = geolocator.geocode(
+            query,
+            timeout=10,
+            exactly_one=False,
+            limit=5,
+            addressdetails=True,
+            country_codes=country_code,
+        )
+
+        if not results:
+            continue
+
+        if not isinstance(results, list):
+            results = [results]
+
+        candidates.extend(results)
+
+    return dedupe_geocode_candidates(candidates)
+
+
+def reverse_geocode_arcgis_location(latitude, longitude):
+    try:
+        response = requests.get(
+            ARCGIS_REVERSE_GEOCODE_URL,
+            params={
+                "location": f"{longitude},{latitude}",
+                "f": "pjson",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"ArcGIS reverse geocode failed: {str(exc)}",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"ArcGIS reverse geocode returned invalid JSON: {str(exc)}",
+        ) from exc
+
+    if data.get("error"):
+        message = (
+            data["error"].get("message")
+            or "ArcGIS reverse geocode returned an error"
+        )
+        raise HTTPException(status_code=500, detail=message)
+
+    if not data.get("address"):
+        raise HTTPException(
+            status_code=404,
+            detail="ArcGIS reverse geocode did not return an address",
+        )
+
+    return data
+
+def get_nrel_pvwatts_data(lat: float, lon: float):
+    api_key = get_nrel_api_key()
+    if not api_key:
+        raise ValueError("NREL_API_KEY is not configured")
+
+    params = {
+        "format": "json",
+        "api_key": api_key,
+        "system_capacity": NREL_PVWATTS_REFERENCE_SYSTEM_KW,
+        "module_type": NREL_PVWATTS_DEFAULT_MODULE_TYPE,
+        "losses": NREL_PVWATTS_DEFAULT_LOSSES,
+        "array_type": NREL_PVWATTS_DEFAULT_ARRAY_TYPE,
+        "tilt": estimate_pvwatts_tilt(lat),
+        "azimuth": NREL_PVWATTS_DEFAULT_AZIMUTH,
+        "lat": lat,
+        "lon": lon,
+        "dataset": NREL_PVWATTS_DEFAULT_DATASET,
+        "radius": NREL_PVWATTS_DEFAULT_RADIUS,
+        "inv_eff": NREL_PVWATTS_DEFAULT_INV_EFFICIENCY,
+    }
+
+    try:
+        response = requests.get(NREL_PVWATTS_URL, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as exc:
+        logger.error("Error fetching NREL PVWatts data: %s", str(exc))
+        raise HTTPException(status_code=502, detail=f"Error fetching NREL PVWatts data: {str(exc)}") from exc
+    except ValueError as exc:
+        logger.error("Error parsing NREL PVWatts response: %s", str(exc))
+        raise HTTPException(status_code=500, detail=f"Error parsing NREL PVWatts response: {str(exc)}") from exc
+
+    errors = data.get("errors") or []
+    if errors:
+        detail = "; ".join(str(error) for error in errors)
+        raise HTTPException(status_code=502, detail=f"NREL PVWatts error: {detail}")
+
+    outputs = data.get("outputs") or {}
+    ac_monthly = outputs.get("ac_monthly") or []
+    solrad_monthly = outputs.get("solrad_monthly") or []
+    if len(ac_monthly) < 12 or len(solrad_monthly) < 12:
+        raise HTTPException(
+            status_code=500,
+            detail="NREL PVWatts response did not include 12 months of production and solar data",
+        )
+
+    monthly_ac_per_kw = month_dict_from_sequence(ac_monthly, digits=1)
+    monthly_all_sky = month_dict_from_sequence(solrad_monthly, digits=2)
+    annual_production_per_kw = round(float(outputs.get("ac_annual") or sum(ac_monthly)), 2)
+    annual_solrad = round(float(outputs.get("solrad_annual") or 0), 2)
+    capacity_factor = round(float(outputs.get("capacity_factor") or 0) / 100, 4)
+    station_info = data.get("station_info") or {}
+
+    return {
+        "provider": "nrel-pvwatts",
+        "avg_all_sky_radiation": annual_solrad,
+        "avg_clear_sky_radiation": annual_solrad,
+        "monthly_all_sky": monthly_all_sky,
+        "monthly_clear_sky": dict(monthly_all_sky),
+        "all_sky_data_quality": 100.0,
+        "clear_sky_data_quality": 100.0,
+        "latitude": lat,
+        "longitude": lon,
+        "period": "daily average",
+        "pvwatts": {
+            "version": data.get("version"),
+            "inputs": {
+                "system_capacity": NREL_PVWATTS_REFERENCE_SYSTEM_KW,
+                "module_type": NREL_PVWATTS_DEFAULT_MODULE_TYPE,
+                "losses": NREL_PVWATTS_DEFAULT_LOSSES,
+                "array_type": NREL_PVWATTS_DEFAULT_ARRAY_TYPE,
+                "tilt": params["tilt"],
+                "azimuth": params["azimuth"],
+                "dataset": params["dataset"],
+                "radius": params["radius"],
+                "inv_eff": params["inv_eff"],
+            },
+            "station_info": {
+                "lat": station_info.get("lat"),
+                "lon": station_info.get("lon"),
+                "city": station_info.get("city"),
+                "state": station_info.get("state"),
+                "distance": station_info.get("distance"),
+                "weather_data_source": station_info.get("weather_data_source"),
+            },
+            "warnings": data.get("warnings") or [],
+            "outputs": {
+                "ac_monthly_per_kw": monthly_ac_per_kw,
+                "ac_annual_per_kw": annual_production_per_kw,
+                "capacity_factor": capacity_factor,
+                "solrad_monthly": monthly_all_sky,
+                "solrad_annual": annual_solrad,
+            },
+        },
+    }
+
 
 def get_nasa_power_data(lat: float, lon: float):
     """
@@ -185,15 +997,140 @@ def get_nasa_power_data(lat: float, lon: float):
         logger.error(f"Error processing NASA POWER data: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing NASA POWER data: {str(e)}")
 
-def geocode_address(address):
+
+def get_fresh_solar_data(lat: float, lon: float):
+    if get_nrel_api_key():
+        try:
+            return get_nrel_pvwatts_data(lat, lon), "nrel-pvwatts"
+        except HTTPException as exc:
+            logger.warning("NREL PVWatts unavailable, falling back to NASA POWER: %s", exc.detail)
+        except Exception as exc:
+            logger.warning("NREL PVWatts unavailable, falling back to NASA POWER: %s", str(exc))
+
+    solar_data = get_nasa_power_data(lat, lon)
+    solar_data["provider"] = "nasa"
+    return solar_data, "nasa"
+
+def geocode_location(address):
     try:
-        location = geolocator.geocode(address, timeout=10)
-        if location:
-            return location.latitude, location.longitude
-        else:
+        provider = get_geocoder_provider()
+        country_code = get_country_code(address.get("country", ""))
+        unique_candidates = []
+
+        if provider in {"nominatim", "hybrid"}:
+            unique_candidates.extend(fetch_nominatim_candidates(address))
+
+        if provider == "arcgis":
+            unique_candidates = dedupe_geocode_candidates(
+                [*unique_candidates, *fetch_arcgis_forward_candidates(address)]
+            )
+
+        if country_code == "us" and extract_house_number(address.get("street", "")):
+            arcgis_candidate = fetch_arcgis_point_address(address)
+            if arcgis_candidate and provider in {"arcgis", "hybrid"}:
+                unique_candidates = dedupe_geocode_candidates(
+                    [*unique_candidates, arcgis_candidate]
+                )
+
+        if not unique_candidates:
             raise HTTPException(status_code=404, detail="Address not found")
+
+        evaluated_candidates = []
+        for location in unique_candidates:
+            forward_score = score_geocode_candidate(address, location)
+            precision_score = score_location_precision(location)
+            evaluated_candidates.append(
+                {
+                    "location": location,
+                    "match_score": forward_score + precision_score,
+                    "forward_score": forward_score,
+                    "precision_score": precision_score,
+                    "reverse_score": 0,
+                }
+            )
+
+        evaluated_candidates.sort(key=lambda item: item["match_score"], reverse=True)
+
+        for candidate in evaluated_candidates[:3]:
+            reverse_score = score_reverse_geocode_candidate(address, candidate["location"])
+            candidate["reverse_score"] = reverse_score
+            candidate["match_score"] += reverse_score
+
+        best_candidate = max(evaluated_candidates, key=lambda item: item["match_score"])
+        best_location = best_candidate["location"]
+        match_score = best_candidate["match_score"]
+        source = get_location_source(best_location)
+
+        return {
+            "location": best_location,
+            "match_score": match_score,
+            "match_quality": assess_match_quality(match_score),
+            "source": source,
+        }
+    except HTTPException:
+        raise
     except GeocoderTimedOut:
         raise HTTPException(status_code=408, detail="Geocoding service timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def geocode_address(address):
+    geocode_result = geocode_location(address)
+    location = geocode_result["location"]
+    return location.latitude, location.longitude
+
+
+def reverse_geocode_location(latitude, longitude):
+    try:
+        if get_geocoder_provider() == "arcgis":
+            payload = reverse_geocode_arcgis_location(latitude, longitude)
+            reverse_address = payload.get("address", {}) or {}
+            house_number = reverse_address.get("AddNum", "")
+            road = (reverse_address.get("Address", "") or "").strip()
+            if house_number and road.lower().startswith(f"{house_number.lower()} "):
+                road = road[len(house_number):].strip()
+            formatted_address = (
+                reverse_address.get("LongLabel")
+                or reverse_address.get("Match_addr")
+                or reverse_address.get("Address")
+                or f"{round(latitude, 6)}, {round(longitude, 6)}"
+            )
+            return build_location(
+                formatted_address,
+                latitude,
+                longitude,
+                {
+                    "provider": "arcgis",
+                    "source": "arcgis-reverse",
+                    "boundingbox": None,
+                    "address": {
+                        "house_number": house_number,
+                        "road": road,
+                        "city": reverse_address.get("City", ""),
+                        "state": reverse_address.get("RegionAbbr", "") or reverse_address.get("Region", ""),
+                        "postcode": reverse_address.get("Postal", ""),
+                        "country": reverse_address.get("CntryName", "") or reverse_address.get("CountryCode", ""),
+                    },
+                },
+            )
+
+        location = geolocator.reverse(
+            f"{latitude}, {longitude}",
+            timeout=10,
+            exactly_one=True,
+            zoom=18,
+            addressdetails=True,
+        )
+
+        if not location:
+            raise HTTPException(status_code=404, detail="Unable to resolve an address from browser location")
+
+        return location
+    except HTTPException:
+        raise
+    except GeocoderTimedOut:
+        raise HTTPException(status_code=408, detail="Reverse geocoding service timed out")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -203,8 +1140,8 @@ async def store_user_data(request: Request, user_data: UserData):
     try:
         ip_address = request.client.host
         guid = str(uuid.uuid4())
-        store_personal_info(guid, user_data.address.dict())  # Convert to dict
-        store_browser_data(guid, user_data.browserData.dict(), ip_address)  # Convert to dict
+        store_personal_info(guid, user_data.address.model_dump())
+        store_browser_data(guid, user_data.browserData.model_dump(), ip_address)
         return {"guid": guid}
     except Exception as e:
         logging.error(f"Error storing user data: {e}")
@@ -217,8 +1154,394 @@ def get_timezone(lat, lon):
     tf = TimezoneFinder()
     return tf.timezone_at(lat=lat, lng=lon)
 
-@app.post("/api/solar-potential", response_model=dict, summary="Calculate Solar Potential", description="Calculates the solar potential based on user data and system specifications.")
-def calculate_solar_potential(input_data: SolarPotentialRequest):
+
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def normalize_panel_efficiency(panel_efficiency):
+    return clamp(float(panel_efficiency or 0.20), 0.15, 0.27)
+
+
+def calculate_roof_backed_system_size(roof_selection, panel_efficiency):
+    if not roof_selection:
+        return None
+
+    area_square_meters = float(roof_selection.get("areaSquareMeters") or 0)
+    if area_square_meters > 0:
+        normalized_efficiency = normalize_panel_efficiency(panel_efficiency)
+        kw = area_square_meters * normalized_efficiency * ROOF_COVERAGE_FACTOR
+        return round(clamp(kw, 1.5, 18.0), 2)
+
+    recommended_kw = roof_selection.get("recommendedKw")
+    if recommended_kw is None:
+        return None
+
+    return round(float(recommended_kw), 2)
+
+
+def resolve_temperature_factor(avg_all_sky_radiation):
+    if avg_all_sky_radiation >= 5.75:
+        return 0.90
+    if avg_all_sky_radiation >= 4.75:
+        return 0.92
+    if avg_all_sky_radiation >= 3.75:
+        return 0.94
+    return 0.96
+
+
+def build_solar_production_model(
+    system_size_kw,
+    monthly_all_sky,
+    avg_all_sky_radiation,
+    panel_efficiency,
+    electricity_rate,
+    roof_selection,
+):
+    normalized_efficiency = normalize_panel_efficiency(panel_efficiency)
+    loss_factors = {
+        "inverter": 0.96,
+        "electrical": 0.98,
+        "soiling": 0.97,
+        "availability": 0.99,
+        "temperature": resolve_temperature_factor(avg_all_sky_radiation),
+        "layout": 0.96 if roof_selection else 0.90,
+    }
+
+    performance_ratio = 1.0
+    for factor in loss_factors.values():
+        performance_ratio *= factor
+    performance_ratio = round(performance_ratio, 3)
+
+    monthly_production = {}
+    monthly_savings = {}
+    for month, radiation in monthly_all_sky.items():
+        monthly_output = round(
+            float(radiation or 0)
+            * system_size_kw
+            * performance_ratio
+            * MONTH_DAY_COUNTS.get(month, 30),
+            1,
+        )
+        monthly_production[month] = monthly_output
+        monthly_savings[month] = round(monthly_output * electricity_rate, 2)
+
+    annual_production = round(sum(monthly_production.values()), 2)
+    daily_production = round(annual_production / 365, 2)
+    specific_yield = round(annual_production / system_size_kw, 2) if system_size_kw else 0
+    capacity_factor = round(
+        annual_production / (system_size_kw * 24 * 365),
+        4,
+    ) if system_size_kw else 0
+    peak_month = max(monthly_production.items(), key=lambda item: item[1]) if monthly_production else (None, 0)
+    lowest_month = min(monthly_production.items(), key=lambda item: item[1]) if monthly_production else (None, 0)
+
+    return {
+        "id": "roof-backed-monthly-v1",
+        "label": "Roof-backed monthly model",
+        "description": (
+            "Uses month-by-month solar resource data, roof-backed DC sizing, and explicit "
+            "system-loss assumptions instead of a single annualized screening multiplier."
+        ),
+        "roof_coverage_factor": ROOF_COVERAGE_FACTOR,
+        "effective_panel_efficiency": normalized_efficiency,
+        "performance_ratio": performance_ratio,
+        "loss_factors": loss_factors,
+        "monthly_production": monthly_production,
+        "monthly_savings": monthly_savings,
+        "annual_production": annual_production,
+        "daily_production": daily_production,
+        "specific_yield": specific_yield,
+        "capacity_factor": capacity_factor,
+        "peak_month": {
+            "month": peak_month[0],
+            "value": round(peak_month[1], 1),
+        },
+        "lowest_month": {
+            "month": lowest_month[0],
+            "value": round(lowest_month[1], 1),
+        },
+    }
+
+
+def build_nrel_pvwatts_production_model(
+    system_size_kw,
+    solar_data,
+    panel_efficiency,
+    electricity_rate,
+):
+    pvwatts = solar_data.get("pvwatts") or {}
+    outputs = pvwatts.get("outputs") or {}
+    inputs = pvwatts.get("inputs") or {}
+    monthly_ac_per_kw = outputs.get("ac_monthly_per_kw") or {}
+    monthly_production = {
+        month: round(float(ac_per_kw or 0) * system_size_kw, 1)
+        for month, ac_per_kw in monthly_ac_per_kw.items()
+    }
+    monthly_savings = {
+        month: round(production * electricity_rate, 2)
+        for month, production in monthly_production.items()
+    }
+    annual_production = round(sum(monthly_production.values()), 2)
+    daily_production = round(annual_production / 365, 2)
+    specific_yield = round(annual_production / system_size_kw, 2) if system_size_kw else 0
+    capacity_factor = round(float(outputs.get("capacity_factor") or 0), 4)
+    peak_month = max(monthly_production.items(), key=lambda item: item[1]) if monthly_production else (None, 0)
+    lowest_month = min(monthly_production.items(), key=lambda item: item[1]) if monthly_production else (None, 0)
+    losses = float(inputs.get("losses") or NREL_PVWATTS_DEFAULT_LOSSES)
+    inverter_efficiency = float(inputs.get("inv_eff") or NREL_PVWATTS_DEFAULT_INV_EFFICIENCY)
+    performance_ratio = round((1 - (losses / 100)) * (inverter_efficiency / 100), 3)
+
+    return {
+        "id": "nrel-pvwatts-v8",
+        "label": "NREL PVWatts V8",
+        "description": (
+            "Uses NREL PVWatts V8 with NSRDB weather data, a roof-mounted reference profile, "
+            "latitude-based tilt fallback, and south-facing azimuth fallback because roof pitch, "
+            "azimuth, and shading are not modeled yet."
+        ),
+        "roof_coverage_factor": ROOF_COVERAGE_FACTOR,
+        "effective_panel_efficiency": normalize_panel_efficiency(panel_efficiency),
+        "performance_ratio": performance_ratio,
+        "loss_factors": {
+            "aggregate_system_losses": round(1 - (losses / 100), 3),
+            "inverter": round(inverter_efficiency / 100, 3),
+        },
+        "assumed_tilt": round(float(inputs.get("tilt") or 0), 1),
+        "assumed_azimuth": round(float(inputs.get("azimuth") or 0), 1),
+        "weather_data_source": (pvwatts.get("station_info") or {}).get("weather_data_source"),
+        "warnings": pvwatts.get("warnings") or [],
+        "monthly_production": monthly_production,
+        "monthly_savings": monthly_savings,
+        "annual_production": annual_production,
+        "daily_production": daily_production,
+        "specific_yield": specific_yield,
+        "capacity_factor": capacity_factor,
+        "peak_month": {
+            "month": peak_month[0],
+            "value": round(peak_month[1], 1),
+        },
+        "lowest_month": {
+            "month": lowest_month[0],
+            "value": round(lowest_month[1], 1),
+        },
+    }
+
+
+def build_solar_assumptions(
+    system_size_kw,
+    sizing_source,
+    roof_selection,
+    panel_efficiency,
+    electricity_rate,
+    installation_cost_per_watt,
+    data_source,
+    solar_provider,
+    data_quality,
+    production_model,
+):
+    normalized_efficiency = normalize_panel_efficiency(panel_efficiency)
+
+    if sizing_source == "roof-geometry" and roof_selection:
+        system_size_assumption = (
+            f"System size uses the saved roof selection: {system_size_kw:.1f} kW from "
+            f"{round(float(roof_selection.get('areaSquareFeet', 0))):,} sq ft, "
+            f"{normalized_efficiency * 100:.0f}% panel efficiency, and a "
+            f"{ROOF_COVERAGE_FACTOR * 100:.0f}% roof coverage allowance."
+        )
+    else:
+        system_size_assumption = f"System size uses a manual input of {system_size_kw:.1f} kW."
+
+    if solar_provider == "nrel-pvwatts":
+        production_assumption = (
+            "Production uses NREL PVWatts V8 with NSRDB weather data, a roof-mounted array type, "
+            f"{production_model.get('assumed_tilt', 0):.0f}° tilt, "
+            f"{production_model.get('assumed_azimuth', 180):.0f}° azimuth, and "
+            f"{NREL_PVWATTS_DEFAULT_LOSSES:.0f}% aggregate system losses."
+        )
+        data_source_assumption = (
+            "Solar resource and production modeling use NREL PVWatts V8; cache layers only change "
+            "how the profile was retrieved, not the underlying model."
+        )
+    else:
+        production_assumption = (
+            "Monthly production uses month-by-month solar irradiance with an estimated "
+            f"{production_model.get('performance_ratio', 0) * 100:.0f}% performance ratio."
+        )
+        data_source_assumption = (
+            f"Solar resource data source is {data_source or 'unknown'} with {data_quality} quality."
+        )
+
+    return [
+        system_size_assumption,
+        production_assumption,
+        f"Panel efficiency is assumed at {normalized_efficiency * 100:.0f}%.",
+        f"Electricity rate is assumed at ${electricity_rate:.2f}/kWh.",
+        f"Installed cost is assumed at ${installation_cost_per_watt:.2f}/W.",
+        data_source_assumption,
+        "Shading, azimuth, roof pitch, utility tariff detail, and roof obstructions are not modeled yet.",
+        "This is a stronger planning model, but it is still not an installer quote or permit-ready design.",
+    ]
+
+
+def build_solar_confidence(
+    match_quality,
+    data_quality,
+    sizing_source,
+    data_source,
+    solar_provider,
+    roof_selection,
+    production_model,
+):
+    score = 38
+    factors = []
+
+    if sizing_source == "roof-geometry" and roof_selection:
+        score += 22
+        factors.append("System size is derived from the saved roof geometry and panel efficiency.")
+    else:
+        score += 6
+        factors.append("System size is using a manual fallback instead of saved roof geometry.")
+
+    if solar_provider == "nrel-pvwatts":
+        score += 12
+        factors.append("Production uses NREL PVWatts V8 with NSRDB weather data.")
+        factors.append("Roof pitch, azimuth, and shading still use generic assumptions.")
+    elif production_model:
+        score += 8
+        factors.append(
+            "Production uses month-by-month solar resource data and explicit system-loss assumptions."
+        )
+
+    if match_quality == "high":
+        score += 18
+        factors.append("Address match quality is strong for the current property.")
+    elif match_quality == "medium":
+        score += 10
+        factors.append("Address match quality is approximate, so parcel precision is lower.")
+    else:
+        factors.append("Address match quality is loose, so location precision is limited.")
+
+    if data_quality == "high":
+        score += 18
+        factors.append("Solar resource data quality is high.")
+    elif data_quality == "medium":
+        score += 10
+        factors.append("Solar resource data quality is moderate.")
+    else:
+        factors.append("Solar resource data quality is limited.")
+
+    if data_source == "zip-cache":
+        score -= 6
+        factors.append("Solar data came from ZIP-level cache rather than a property-specific fetch.")
+    elif data_source == "guid-cache":
+        score += 6
+        factors.append("Solar data came from this property record's recent cache.")
+    elif data_source == "nrel-pvwatts":
+        score += 10
+        factors.append("Solar data came from a location-specific NREL PVWatts fetch.")
+    elif data_source == "nasa":
+        score += 8
+        factors.append("Solar data came from a location-specific NASA POWER fetch.")
+
+    roof_area_square_feet = float(roof_selection.get("areaSquareFeet", 0)) if roof_selection else 0
+    if roof_area_square_feet and roof_area_square_feet < 350:
+        score -= 4
+        factors.append("The selected roof area is small, so the estimate is more sensitive to drawing changes.")
+
+    score = max(20, min(95, score))
+
+    if score >= 80:
+        confidence_id = "high"
+        description = (
+            "Useful planning estimate with roof-backed sizing, monthly production modeling, and solid source inputs."
+        )
+    elif score >= 60:
+        confidence_id = "medium"
+        description = (
+            "Useful planning estimate, but one or more source or property inputs are still approximate."
+        )
+    else:
+        confidence_id = "low"
+        description = "Treat this as a rough screening estimate until the inputs are improved."
+
+    return {
+        "id": confidence_id,
+        "label": confidence_id.capitalize(),
+        "score": score,
+        "description": description,
+        "factors": factors,
+    }
+
+
+def build_solar_report_name(address):
+    timestamp_label = datetime.now().astimezone().strftime("%b %d, %Y %I:%M %p")
+    street = address.get("street") or "Property"
+    return f"{street} solar report · {timestamp_label}"
+
+
+def build_saved_solar_report(address, estimate, report_name=None):
+    return {
+        "id": str(uuid.uuid4()),
+        "name": report_name or build_solar_report_name(address),
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "address": estimate["address"],
+        "system_size_kw": estimate["system_size_kw"],
+        "annual_production": estimate["annual_production"],
+        "annual_savings": estimate["annual_savings"],
+        "system_cost": estimate["system_cost"],
+        "payback_period": estimate["payback_period"],
+        "confidence": estimate["confidence"],
+        "data_source": estimate["data_source"],
+        "data_provider": estimate.get("data_provider"),
+        "data_quality": estimate["data_quality"],
+        "roof_area_square_feet": estimate["roof_area_square_feet"],
+        "roof_area_square_meters": estimate["roof_area_square_meters"],
+        "production_model": estimate["production_model"],
+        "monthly_production": estimate["monthly_production"],
+        "monthly_savings": estimate["monthly_savings"],
+        "specific_yield": estimate["specific_yield"],
+        "capacity_factor": estimate["capacity_factor"],
+        "assumptions": estimate["assumptions"],
+        "summary": (
+            f"{round(estimate['annual_production']):,} kWh/year, "
+            f"${round(estimate['annual_savings']):,}/year savings, "
+            f"{estimate['confidence']['label']} confidence."
+        ),
+    }
+
+
+def build_homeowner_quote(address, report, existing_quote=None):
+    existing_quote = existing_quote or {}
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    street = address.get("street") or "Property"
+    quote_id = existing_quote.get("id") or str(uuid.uuid4())
+    system_size_kw = round(float(report.get("system_size_kw") or 0), 1)
+    annual_savings = round(float(report.get("annual_savings") or 0))
+    annual_production = round(float(report.get("annual_production") or 0))
+    confidence_label = (report.get("confidence") or {}).get("label") or "Planning"
+
+    return {
+        "id": quote_id,
+        "headline": existing_quote.get("headline") or f"{street} homeowner quote",
+        "created_at": existing_quote.get("created_at") or timestamp,
+        "updated_at": timestamp,
+        "status": "share-ready",
+        "share_path": f"/quote/{quote_id}",
+        "summary": (
+            f"{system_size_kw:.1f} kW, "
+            f"{annual_production:,} kWh/year, "
+            f"${annual_savings:,}/year savings."
+        ),
+        "confidence_label": confidence_label,
+        "disclaimer": (
+            "This is a shareable planning quote based on the saved roof geometry and current model assumptions. "
+            "Final pricing, layout, and installer scope still require site review."
+        ),
+    }
+
+
+def build_solar_estimate_response(input_data):
     guid = input_data.guid
     address = check_existing_address_data(guid)
     if not address:
@@ -226,61 +1549,143 @@ def calculate_solar_potential(input_data: SolarPotentialRequest):
 
     logger.info(f"Address data for GUID {guid}: {address}")
 
+    property_record = get_property_record(guid) or {"address": address}
+    request_roof_selection = (
+        input_data.roof_selection.model_dump() if input_data.roof_selection else None
+    )
+
+    if request_roof_selection is not None:
+        upsert_property_record(
+            guid,
+            address,
+            property_preview=property_record.get("property_preview"),
+            roof_selection=request_roof_selection,
+        )
+        property_record = get_property_record(guid) or {
+            "address": address,
+            "roof_selection": request_roof_selection,
+        }
+
+    roof_selection = request_roof_selection or property_record.get("roof_selection")
+    if roof_selection:
+        system_size_kw = calculate_roof_backed_system_size(
+            roof_selection,
+            input_data.panel_efficiency,
+        )
+        sizing_source = "roof-geometry"
+    elif input_data.system_size is not None:
+        system_size_kw = round(float(input_data.system_size), 2)
+        sizing_source = "manual"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Draw a roof area first or provide a system size.",
+        )
+
+    if not system_size_kw:
+        raise HTTPException(status_code=400, detail="Unable to determine a usable system size.")
+
     solar_data, time_zone = check_existing_solar_data(guid)
+    data_source = "guid-cache" if solar_data else None
     if not solar_data:
         try:
-            solar_data, time_zone = check_existing_zip_data(address['zip'])
+            solar_data, time_zone = check_existing_zip_data(address["zip"])
+            data_source = "zip-cache" if solar_data else None
         except Exception as e:
             logger.error(f"Error checking existing ZIP data: {str(e)}")
             solar_data, time_zone = None, None
+            data_source = None
 
-    # If we still don't have solar_data, we need to fetch it from the NASA API
     if not solar_data:
-        # Geocode the address to get lat and lon
-        lat, lon = geocode_address(f"{address['street']}, {address['city']}, {address['state']} {address['zip']}, {address['country']}")
-        
-        # Fetch data from NASA API
-        nasa_data = get_nasa_power_data(lat, lon)
-        solar_data = nasa_data
+        lat, lon = geocode_address(address)
+        solar_data, fresh_data_source = get_fresh_solar_data(lat, lon)
         time_zone = get_timezone(lat, lon)
-        store_solar_data(guid, solar_data, time_zone, address, "nasa")
+        store_solar_data(guid, solar_data, time_zone, address, fresh_data_source)
+        data_source = fresh_data_source
     else:
-        lat, lon = solar_data.get('latitude'), solar_data.get('longitude')
+        lat, lon = solar_data.get("latitude"), solar_data.get("longitude")
 
-    # Ensure we have lat and lon
     if lat is None or lon is None:
         raise HTTPException(status_code=500, detail="Unable to determine latitude and longitude")
 
-    # Calculate radiation data
-    avg_all_sky_radiation = round(solar_data.get('avg_all_sky_radiation', 0), 2)
-    avg_clear_sky_radiation = round(solar_data.get('avg_clear_sky_radiation', 0), 2)
-
-    # Calculate data quality
-    all_sky_data_quality = round(min(solar_data.get('all_sky_data_quality', 0) * 100, 100), 2)
-    clear_sky_data_quality = round(min(solar_data.get('clear_sky_data_quality', 0) * 100, 100), 2)
-
-    # Prepare monthly data
-    monthly_all_sky = {str(i).zfill(2): round(solar_data.get('monthly_all_sky', {}).get(str(i).zfill(2), 0), 2) for i in range(1, 13)}
-    monthly_clear_sky = {str(i).zfill(2): round(solar_data.get('monthly_clear_sky', {}).get(str(i).zfill(2), 0), 2) for i in range(1, 13)}
-
-    # Calculate best and worst values
+    solar_provider = resolve_solar_provider(solar_data)
+    avg_all_sky_radiation = round(solar_data.get("avg_all_sky_radiation", 0), 2)
+    avg_clear_sky_radiation = round(solar_data.get("avg_clear_sky_radiation", 0), 2)
+    all_sky_data_quality = normalize_quality_percent(solar_data.get("all_sky_data_quality", 0))
+    clear_sky_data_quality = normalize_quality_percent(solar_data.get("clear_sky_data_quality", 0))
+    monthly_all_sky = {
+        str(i).zfill(2): round(solar_data.get("monthly_all_sky", {}).get(str(i).zfill(2), 0), 2)
+        for i in range(1, 13)
+    }
+    monthly_clear_sky = {
+        str(i).zfill(2): round(solar_data.get("monthly_clear_sky", {}).get(str(i).zfill(2), 0), 2)
+        for i in range(1, 13)
+    }
     best_all_sky = round(max(monthly_all_sky.values()), 2) if monthly_all_sky else 0
     worst_all_sky = round(min(monthly_all_sky.values()), 2) if monthly_all_sky else 0
     best_clear_sky = round(max(monthly_clear_sky.values()), 2) if monthly_clear_sky else 0
     worst_clear_sky = round(min(monthly_clear_sky.values()), 2) if monthly_clear_sky else 0
 
-    # Calculate solar potential
-    avg_daily_production = round(avg_all_sky_radiation * input_data.system_size * input_data.panel_efficiency * 0.75, 2)
-    annual_production = round(avg_daily_production * 365, 2)
+    has_pvwatts_profile = bool(
+        ((solar_data.get("pvwatts") or {}).get("outputs") or {}).get("ac_monthly_per_kw")
+    )
+    model_provider = solar_provider if solar_provider == "nrel-pvwatts" and has_pvwatts_profile else "nasa"
+
+    if model_provider == "nrel-pvwatts":
+        production_model = build_nrel_pvwatts_production_model(
+            system_size_kw,
+            solar_data,
+            input_data.panel_efficiency,
+            input_data.electricity_rate,
+        )
+    else:
+        production_model = build_solar_production_model(
+            system_size_kw,
+            monthly_all_sky,
+            avg_all_sky_radiation,
+            input_data.panel_efficiency,
+            input_data.electricity_rate,
+            roof_selection,
+        )
+    annual_production = production_model["annual_production"]
+    daily_production = production_model["daily_production"]
     annual_savings = round(annual_production * input_data.electricity_rate, 2)
-    system_cost = round(input_data.system_size * 1000 * input_data.installation_cost_per_watt, 2)
+    system_cost = round(system_size_kw * 1000 * input_data.installation_cost_per_watt, 2)
     payback_period = round(system_cost / annual_savings, 2) if annual_savings > 0 else None
     total_savings = round(sum([annual_savings * (1.02 ** year) for year in range(25)]), 2)
 
-    # Determine overall data quality
-    overall_quality = "high" if all_sky_data_quality > 80 and clear_sky_data_quality > 80 else "medium" if all_sky_data_quality > 60 and clear_sky_data_quality > 60 else "low"
+    overall_quality = (
+        "high"
+        if all_sky_data_quality > 80 and clear_sky_data_quality > 80
+        else "medium"
+        if all_sky_data_quality > 60 and clear_sky_data_quality > 60
+        else "low"
+    )
+    property_preview = property_record.get("property_preview") or {}
+    match_quality = property_preview.get("match_quality") or "unknown"
+    assumptions = build_solar_assumptions(
+        system_size_kw,
+        sizing_source,
+        roof_selection,
+        input_data.panel_efficiency,
+        input_data.electricity_rate,
+        input_data.installation_cost_per_watt,
+        data_source or "unknown",
+        model_provider,
+        overall_quality,
+        production_model,
+    )
+    confidence = build_solar_confidence(
+        match_quality,
+        overall_quality,
+        sizing_source,
+        data_source or "unknown",
+        model_provider,
+        roof_selection,
+        production_model,
+    )
 
-    response_data = {
+    return {
         "address": f"{address['street']}, {address['city']}, {address['state']} {address['zip']}, {address['country']}",
         "latitude": round(lat, 6),
         "longitude": round(lon, 6),
@@ -294,20 +1699,381 @@ def calculate_solar_potential(input_data: SolarPotentialRequest):
         "worst_all_sky": worst_all_sky,
         "best_clear_sky": best_clear_sky,
         "worst_clear_sky": worst_clear_sky,
+        "monthly_production": production_model["monthly_production"],
+        "monthly_savings": production_model["monthly_savings"],
         "unit": "kWh/m²/day",
         "period": "daily average",
-        "daily_production": avg_daily_production,
+        "match_quality": match_quality,
+        "system_size_kw": system_size_kw,
+        "sizing_source": sizing_source,
+        "roof_area_square_feet": roof_selection.get("areaSquareFeet") if roof_selection else None,
+        "roof_area_square_meters": roof_selection.get("areaSquareMeters") if roof_selection else None,
+        "assumptions": assumptions,
+        "confidence": confidence,
+        "production_model": production_model,
+        "daily_production": daily_production,
         "annual_production": annual_production,
         "annual_savings": annual_savings,
         "system_cost": system_cost,
         "payback_period": payback_period,
         "total_savings_25_years": total_savings,
+        "specific_yield": production_model["specific_yield"],
+        "capacity_factor": production_model["capacity_factor"],
+        "peak_month": production_model["peak_month"],
+        "lowest_month": production_model["lowest_month"],
         "time_zone": time_zone,
-        "data_source": "nasa" if not solar_data else "cache",
-        "data_quality": overall_quality
+        "data_source": data_source or "unknown",
+        "data_provider": solar_provider,
+        "data_quality": overall_quality,
     }
 
-    return response_data
+
+@app.post(
+    "/api/property-record/find",
+    response_model=dict,
+    summary="Find Property Record",
+    description="Finds the latest saved property record for a normalized address so the frontend can reopen saved roof or garden context.",
+)
+def find_property_record(address: Address):
+    record = find_property_record_by_address(address.model_dump())
+    return {"record": record}
+
+
+@app.post(
+    "/api/property-record/recent",
+    response_model=dict,
+    summary="List Recent Property Records",
+    description="Returns recent saved property records so the frontend can reopen prior roof or garden plans without retyping an address.",
+)
+def recent_property_records(payload: PropertyRecordRecentRequest):
+    records = list_property_records(
+        limit=payload.max_items,
+        require_garden_zones=payload.require_garden_zones,
+    )
+    return {"records": records}
+
+
+@app.post(
+    "/api/property-record",
+    response_model=dict,
+    summary="Upsert Property Record",
+    description="Creates or updates the current property record, including normalized address, map preview, roof geometry, and garden zones.",
+)
+def save_property_record(payload: PropertyRecordRequest):
+    guid = payload.guid or str(uuid.uuid4())
+    address = payload.address.model_dump()
+    property_preview = payload.property_preview
+    roof_selection = payload.roof_selection.model_dump() if payload.roof_selection else None
+    garden_zones = (
+        [garden_zone.model_dump() for garden_zone in payload.garden_zones]
+        if payload.garden_zones is not None
+        else None
+    )
+
+    upsert_kwargs = {
+        "property_preview": property_preview,
+        "property_context": payload.property_context,
+        "roof_selection": roof_selection,
+    }
+    if garden_zones is not None:
+        upsert_kwargs["garden_zones"] = garden_zones
+
+    upsert_property_record(guid, address, **upsert_kwargs)
+    saved_record = get_property_record(guid) or {}
+
+    return {
+        "guid": guid,
+        "address": saved_record.get("address", address),
+        "property_preview": saved_record.get("property_preview", property_preview),
+        "property_context": saved_record.get("property_context", payload.property_context),
+        "roof_selection": saved_record.get("roof_selection", roof_selection),
+        "garden_zones": saved_record.get("garden_zones", garden_zones or []),
+        "saved_solar_reports": saved_record.get("saved_solar_reports", []),
+        "stored_at": saved_record.get("stored_at"),
+    }
+
+
+@app.post(
+    "/api/property-preview",
+    response_model=dict,
+    summary="Locate Property",
+    description="Geocodes an address and returns location data for map centering.",
+)
+def preview_property(address: Address):
+    address_dict = address.model_dump()
+    cache_key = build_address_lookup_key(address_dict)
+    cached_preview = get_geocode_cache(FORWARD_PROPERTY_PREVIEW_CACHE, cache_key)
+    if cached_preview:
+        return cached_preview
+
+    formatted_address = format_address(address_dict)
+    geocode_result = geocode_location(address_dict)
+    location = geocode_result["location"]
+    raw_address = getattr(location, "raw", {}).get("address", {}) or {}
+    normalized_address = extract_address_parts(raw_address)
+
+    payload = {
+        "query": formatted_address,
+        "formatted_address": location.address or formatted_address,
+        "latitude": round(location.latitude, 6),
+        "longitude": round(location.longitude, 6),
+        "bounds": parse_bounding_box(location),
+        "source": geocode_result.get("source", "nominatim"),
+        "match_quality": geocode_result["match_quality"],
+        "match_score": geocode_result["match_score"],
+        "address": normalized_address,
+    }
+    store_geocode_cache(
+        FORWARD_PROPERTY_PREVIEW_CACHE,
+        cache_key,
+        payload,
+        payload.get("source"),
+    )
+    return payload
+
+
+@app.post(
+    "/api/reverse-geocode",
+    response_model=dict,
+    summary="Resolve Browser Location",
+    description="Reverse geocodes browser coordinates into a normalized address and map preview.",
+)
+def reverse_geocode_property(coordinates: Coordinates):
+    cache_key = build_coordinate_lookup_key(coordinates.latitude, coordinates.longitude)
+    cached_preview = get_geocode_cache(REVERSE_PROPERTY_PREVIEW_CACHE, cache_key)
+    if cached_preview:
+        return cached_preview
+
+    location = reverse_geocode_location(coordinates.latitude, coordinates.longitude)
+    raw_address = getattr(location, "raw", {}).get("address", {}) or {}
+    normalized_address = extract_address_parts(raw_address)
+
+    payload = {
+        "query": f"{round(coordinates.latitude, 6)}, {round(coordinates.longitude, 6)}",
+        "formatted_address": location.address or format_address(normalized_address),
+        "latitude": round(location.latitude, 6),
+        "longitude": round(location.longitude, 6),
+        "bounds": parse_bounding_box(location),
+        "source": "browser-location",
+        "match_quality": "high",
+        "match_score": None,
+        "address": normalized_address,
+    }
+    store_geocode_cache(
+        REVERSE_PROPERTY_PREVIEW_CACHE,
+        cache_key,
+        payload,
+        payload.get("source"),
+    )
+    return payload
+
+
+@app.post(
+    "/api/property-context",
+    response_model=dict,
+    summary="Get Property Context",
+    description="Returns first-pass building and terrain context around the property for Garden Buddy.",
+)
+def get_property_context(payload: PropertyContextRequest):
+    try:
+        return get_property_context_snapshot(
+            payload.latitude,
+            payload.longitude,
+            bounds=payload.bounds.model_dump() if payload.bounds else None,
+            match_quality=payload.match_quality,
+        )
+    except requests.HTTPError as exc:
+        logger.error("Property context upstream request failed: %s", str(exc))
+        raise HTTPException(status_code=502, detail="Unable to load property context data")
+    except Exception as exc:
+        logger.error("Property context processing failed: %s", str(exc))
+        raise HTTPException(status_code=500, detail="Unable to process property context data")
+
+
+@app.post(
+    "/api/space-weather",
+    response_model=dict,
+    summary="Get Space Weather",
+    description="Returns live flare, solar wind, and geomagnetic context localized to the provided coordinates.",
+)
+def get_space_weather(coordinates: Coordinates):
+    time_zone = get_timezone(coordinates.latitude, coordinates.longitude) or "UTC"
+    try:
+        return get_space_weather_snapshot(
+            coordinates.latitude,
+            coordinates.longitude,
+            time_zone,
+        )
+    except requests.HTTPError as exc:
+        logger.error("Space weather upstream request failed: %s", str(exc))
+        raise HTTPException(status_code=502, detail="Unable to load space weather data")
+    except Exception as exc:
+        logger.error("Space weather processing failed: %s", str(exc))
+        raise HTTPException(status_code=500, detail="Unable to process space weather data")
+
+
+@app.post(
+    "/api/surface-irradiance",
+    response_model=dict,
+    summary="Get Surface Irradiance",
+    description="Returns live and near-term surface irradiance conditions for the provided coordinates.",
+)
+def get_surface_irradiance(coordinates: Coordinates):
+    time_zone = get_timezone(coordinates.latitude, coordinates.longitude) or "UTC"
+    try:
+        return get_surface_irradiance_snapshot(
+            coordinates.latitude,
+            coordinates.longitude,
+            time_zone,
+        )
+    except requests.HTTPError as exc:
+        logger.error("Surface irradiance upstream request failed: %s", str(exc))
+        raise HTTPException(status_code=502, detail="Unable to load surface irradiance data")
+    except Exception as exc:
+        logger.error("Surface irradiance processing failed: %s", str(exc))
+        raise HTTPException(status_code=500, detail="Unable to process surface irradiance data")
+
+
+@app.post(
+    "/api/property-climate",
+    response_model=dict,
+    summary="Get Property Climate",
+    description="Returns historical climate context and an estimated hardiness band for the provided coordinates.",
+)
+def get_property_climate(coordinates: Coordinates):
+    time_zone = get_timezone(coordinates.latitude, coordinates.longitude) or "UTC"
+    try:
+        return get_property_climate_snapshot(
+            coordinates.latitude,
+            coordinates.longitude,
+            time_zone,
+        )
+    except requests.HTTPError as exc:
+        logger.error("Property climate upstream request failed: %s", str(exc))
+        raise HTTPException(status_code=502, detail="Unable to load property climate data")
+    except Exception as exc:
+        logger.error("Property climate processing failed: %s", str(exc))
+        raise HTTPException(status_code=500, detail="Unable to process property climate data")
+
+
+@app.post("/api/solar-potential", response_model=dict, summary="Calculate Solar Potential", description="Calculates the solar potential based on user data and system specifications.")
+def calculate_solar_potential(input_data: SolarPotentialRequest):
+    return build_solar_estimate_response(input_data)
+
+
+@app.post(
+    "/api/solar-report",
+    response_model=dict,
+    summary="Save Solar Report",
+    description="Recomputes the current roof-backed solar estimate and saves a report snapshot to the property record.",
+)
+def save_solar_report(payload: SolarReportRequest):
+    estimate_request = SolarPotentialRequest(
+        guid=payload.guid,
+        system_size=None,
+        panel_efficiency=payload.panel_efficiency,
+        electricity_rate=payload.electricity_rate,
+        installation_cost_per_watt=payload.installation_cost_per_watt,
+        roof_selection=payload.roof_selection,
+    )
+    estimate = build_solar_estimate_response(estimate_request)
+    property_record = get_property_record(payload.guid)
+    if not property_record:
+        raise HTTPException(status_code=404, detail="Property record not found")
+
+    address = property_record["address"]
+    reports = property_record.get("saved_solar_reports") or []
+    report = build_saved_solar_report(address, estimate, payload.report_name)
+    next_reports = [report, *reports][:8]
+    upsert_property_record(
+        payload.guid,
+        address,
+        property_preview=property_record.get("property_preview"),
+        roof_selection=property_record.get("roof_selection"),
+        garden_zones=property_record.get("garden_zones") or [],
+        saved_solar_reports=next_reports,
+    )
+
+    return {
+        "report": report,
+        "reports": next_reports,
+        "estimate": estimate,
+    }
+
+
+@app.post(
+    "/api/solar-quote",
+    response_model=dict,
+    summary="Create Shareable Solar Quote",
+    description="Promotes a saved solar report into a shareable homeowner quote without changing the underlying report snapshot.",
+)
+def create_solar_quote(payload: SolarQuoteRequest):
+    property_record = get_property_record(payload.guid)
+    if not property_record:
+        raise HTTPException(status_code=404, detail="Property record not found")
+
+    reports = property_record.get("saved_solar_reports") or []
+    target_report = next((report for report in reports if report.get("id") == payload.report_id), None)
+    if not target_report:
+        raise HTTPException(status_code=404, detail="Saved solar report not found")
+
+    quote = build_homeowner_quote(
+        property_record["address"],
+        target_report,
+        target_report.get("homeowner_quote"),
+    )
+    next_reports = []
+    updated_report = None
+    for report in reports:
+        if report.get("id") != payload.report_id:
+            next_reports.append(report)
+            continue
+
+        updated_report = {
+            **report,
+            "homeowner_quote": quote,
+        }
+        next_reports.append(updated_report)
+
+    upsert_property_record(
+        payload.guid,
+        property_record["address"],
+        property_preview=property_record.get("property_preview"),
+        roof_selection=property_record.get("roof_selection"),
+        garden_zones=property_record.get("garden_zones") or [],
+        saved_solar_reports=next_reports,
+    )
+
+    return {
+        "quote": quote,
+        "report": updated_report,
+        "reports": next_reports,
+    }
+
+
+@app.get(
+    "/api/solar-quote/{quote_id}",
+    response_model=dict,
+    summary="Get Shareable Solar Quote",
+    description="Returns the saved solar report snapshot and share metadata for a homeowner-facing quote page.",
+)
+def get_solar_quote(quote_id: str):
+    match = find_solar_quote(quote_id)
+    if not match:
+        raise HTTPException(status_code=404, detail="Solar quote not found")
+
+    record = match["record"]
+    return {
+        "quote": match["quote"],
+        "report": match["report"],
+        "address": record.get("address"),
+        "property_preview": record.get("property_preview"),
+    }
+
+
+@app.get("/health", response_model=dict, include_in_schema=False)
+def health_check():
+    return {"status": "ok"}
 
 @app.get("/api/privacy-policy", response_model=dict, summary="Get Privacy Policy", description="Returns the privacy policy of the application.")
 def get_privacy_policy():

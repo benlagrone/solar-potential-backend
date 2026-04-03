@@ -1,13 +1,13 @@
 from dotenv import load_dotenv
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
 import os
-import uuid
 
 load_dotenv()
 
 class GoogleSheetsService:
     def __init__(self):
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+
         # print(f"****Current Working Directory: {os.getcwd()}")
         credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         # print(f"***GOOGLE_APPLICATION_CREDENTIALS: {credentials_path}") 
