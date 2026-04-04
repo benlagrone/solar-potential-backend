@@ -4,6 +4,7 @@ import os
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
+from garden_crop_catalog_seed import GARDEN_CROP_CATALOG_SEED
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +13,7 @@ _browser_data_memory = {}
 _solar_data_memory = {}
 _property_record_memory = {}
 _geocode_cache_memory = {}
+_garden_crop_catalog_memory = {}
 _UNSET = object()
 _RECENT_CACHE_DAYS = 30
 
@@ -21,6 +23,10 @@ def _stored_at_value():
 
 
 def _property_record_stored_at_value():
+    return datetime.now().isoformat()
+
+
+def _reference_data_stored_at_value():
     return datetime.now().isoformat()
 
 
@@ -120,6 +126,13 @@ def _initialize_db(connection):
 
         CREATE INDEX IF NOT EXISTS idx_geocode_cache_query_type
             ON geocode_cache(query_type, stored_at);
+
+        CREATE TABLE IF NOT EXISTS garden_crop_catalogs (
+            catalog_id TEXT PRIMARY KEY,
+            version TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            stored_at TEXT NOT NULL
+        );
         """
     )
     columns = {
@@ -128,6 +141,7 @@ def _initialize_db(connection):
     }
     if "property_context_json" not in columns:
         connection.execute("ALTER TABLE property_records ADD COLUMN property_context_json TEXT")
+    _seed_garden_crop_catalog(connection)
     connection.commit()
 
 
@@ -165,6 +179,65 @@ def _remember_property_record(record):
 
     _property_record_memory.pop(guid, None)
     _property_record_memory[guid] = record
+
+
+def _garden_crop_catalog_seed_payload():
+    return json.loads(json.dumps(GARDEN_CROP_CATALOG_SEED))
+
+
+def _remember_garden_crop_catalog(payload):
+    catalog_id = payload.get("catalog_id")
+    if not catalog_id:
+        return
+
+    _garden_crop_catalog_memory.pop(catalog_id, None)
+    _garden_crop_catalog_memory[catalog_id] = payload
+
+
+def _write_garden_crop_catalog(connection, payload):
+    stored_at = payload.get("stored_at") or _reference_data_stored_at_value()
+    normalized_payload = {
+        **payload,
+        "stored_at": stored_at,
+    }
+    connection.execute(
+        """
+        INSERT INTO garden_crop_catalogs (
+            catalog_id,
+            version,
+            payload_json,
+            stored_at
+        )
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(catalog_id) DO UPDATE SET
+            version = excluded.version,
+            payload_json = excluded.payload_json,
+            stored_at = excluded.stored_at
+        """,
+        (
+            normalized_payload["catalog_id"],
+            normalized_payload["version"],
+            json.dumps(normalized_payload),
+            stored_at,
+        ),
+    )
+    _remember_garden_crop_catalog(normalized_payload)
+
+
+def _seed_garden_crop_catalog(connection):
+    seed_payload = _garden_crop_catalog_seed_payload()
+    row = connection.execute(
+        """
+        SELECT version
+        FROM garden_crop_catalogs
+        WHERE catalog_id = ?
+        """,
+        (seed_payload["catalog_id"],),
+    ).fetchone()
+    if row and row["version"] == seed_payload["version"]:
+        return
+
+    _write_garden_crop_catalog(connection, seed_payload)
 
 
 def _write_property_record(
@@ -235,6 +308,7 @@ def reset_memory_storage():
     _solar_data_memory.clear()
     _property_record_memory.clear()
     _geocode_cache_memory.clear()
+    _garden_crop_catalog_memory.clear()
 
     try:
         with _connect() as connection:
@@ -242,6 +316,7 @@ def reset_memory_storage():
             connection.execute("DELETE FROM solar_data")
             connection.execute("DELETE FROM geocode_cache")
             connection.execute("DELETE FROM property_records")
+            connection.execute("DELETE FROM garden_crop_catalogs")
             connection.commit()
     except sqlite3.Error as exc:
         logger.warning("Unable to reset SQLite persistence: %s", str(exc))
@@ -323,6 +398,37 @@ def list_property_records(limit=8, require_garden_zones=False):
         records = [record for record in records if record.get("garden_zones")]
 
     return list(reversed(records))[:normalized_limit]
+
+
+def get_garden_crop_catalog(catalog_id="default"):
+    try:
+        with _connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload_json
+                FROM garden_crop_catalogs
+                WHERE catalog_id = ?
+                """,
+                (catalog_id,),
+            ).fetchone()
+        if row:
+            payload = _json_load(row["payload_json"], default={}) or {}
+            if payload:
+                _remember_garden_crop_catalog(payload)
+                return payload
+    except sqlite3.Error as exc:
+        logger.warning("Garden crop catalog lookup fell back to memory: %s", str(exc))
+
+    payload = _garden_crop_catalog_memory.get(catalog_id)
+    if payload:
+        return payload
+
+    seed_payload = _garden_crop_catalog_seed_payload()
+    if seed_payload.get("catalog_id") == catalog_id:
+        _remember_garden_crop_catalog(seed_payload)
+        return seed_payload
+
+    return None
 
 
 def find_solar_quote(quote_id):

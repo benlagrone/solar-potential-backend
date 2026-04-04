@@ -5,12 +5,13 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import logging
+import math
 import os
 from data_persistence import (
     store_personal_info, store_browser_data, store_solar_data,
     check_existing_address_data, check_existing_solar_data, check_existing_zip_data,
     find_property_record_by_address, find_solar_quote, get_property_record, list_property_records,
-    upsert_property_record,
+    upsert_property_record, get_garden_crop_catalog,
     build_address_lookup_key, build_coordinate_lookup_key, get_geocode_cache, store_geocode_cache,
 )
 from property_context import get_property_context_snapshot
@@ -175,6 +176,7 @@ MONTH_DAY_COUNTS = {
     "12": 31,
 }
 ROOF_COVERAGE_FACTOR = 0.565
+EARTH_RADIUS_METERS = 6371000
 NREL_PVWATTS_URL = os.getenv(
     "NREL_PVWATTS_URL",
     "https://developer.nlr.gov/api/pvwatts/v8.json",
@@ -802,7 +804,13 @@ def reverse_geocode_arcgis_location(latitude, longitude):
 
     return data
 
-def get_nrel_pvwatts_data(lat: float, lon: float):
+def get_nrel_pvwatts_data(
+    lat: float,
+    lon: float,
+    tilt: Optional[float] = None,
+    azimuth: Optional[float] = None,
+    losses: Optional[float] = None,
+):
     api_key = get_nrel_api_key()
     if not api_key:
         raise ValueError("NREL_API_KEY is not configured")
@@ -812,10 +820,10 @@ def get_nrel_pvwatts_data(lat: float, lon: float):
         "api_key": api_key,
         "system_capacity": NREL_PVWATTS_REFERENCE_SYSTEM_KW,
         "module_type": NREL_PVWATTS_DEFAULT_MODULE_TYPE,
-        "losses": NREL_PVWATTS_DEFAULT_LOSSES,
+        "losses": losses if losses is not None else NREL_PVWATTS_DEFAULT_LOSSES,
         "array_type": NREL_PVWATTS_DEFAULT_ARRAY_TYPE,
-        "tilt": estimate_pvwatts_tilt(lat),
-        "azimuth": NREL_PVWATTS_DEFAULT_AZIMUTH,
+        "tilt": tilt if tilt is not None else estimate_pvwatts_tilt(lat),
+        "azimuth": azimuth if azimuth is not None else NREL_PVWATTS_DEFAULT_AZIMUTH,
         "lat": lat,
         "lon": lon,
         "dataset": NREL_PVWATTS_DEFAULT_DATASET,
@@ -871,7 +879,7 @@ def get_nrel_pvwatts_data(lat: float, lon: float):
             "inputs": {
                 "system_capacity": NREL_PVWATTS_REFERENCE_SYSTEM_KW,
                 "module_type": NREL_PVWATTS_DEFAULT_MODULE_TYPE,
-                "losses": NREL_PVWATTS_DEFAULT_LOSSES,
+                "losses": params["losses"],
                 "array_type": NREL_PVWATTS_DEFAULT_ARRAY_TYPE,
                 "tilt": params["tilt"],
                 "azimuth": params["azimuth"],
@@ -1159,6 +1167,201 @@ def clamp(value, minimum, maximum):
     return max(minimum, min(maximum, value))
 
 
+def normalize_azimuth(value):
+    return round(float(value) % 360, 1)
+
+
+def angular_distance_degrees(value_a, value_b):
+    distance = abs(float(value_a) - float(value_b)) % 360
+    return min(distance, 360 - distance)
+
+
+def aspect_to_azimuth(aspect):
+    return {
+        "north-facing": 0.0,
+        "east-facing": 90.0,
+        "south-facing": 180.0,
+        "west-facing": 270.0,
+    }.get(aspect)
+
+
+def azimuth_to_direction_group(azimuth):
+    azimuth = normalize_azimuth(azimuth)
+    if 45 <= azimuth < 135:
+        return "east"
+    if 135 <= azimuth < 225:
+        return "south"
+    if 225 <= azimuth < 315:
+        return "west"
+    return "north"
+
+
+def get_polygon_ring_points(geometry):
+    if not geometry or geometry.get("type") != "Polygon":
+        return []
+
+    ring = (geometry.get("coordinates") or [None])[0] or []
+    points = []
+    for coordinate in ring:
+        if not isinstance(coordinate, (list, tuple)) or len(coordinate) < 2:
+            continue
+        try:
+            lng = float(coordinate[0])
+            lat = float(coordinate[1])
+        except (TypeError, ValueError):
+            continue
+        points.append({"lat": lat, "lng": lng})
+
+    if len(points) >= 2 and points[0] == points[-1]:
+        points = points[:-1]
+
+    return points
+
+
+def project_local_point(point, origin_latitude):
+    origin_latitude_radians = math.radians(origin_latitude)
+    return {
+        "x": EARTH_RADIUS_METERS * math.radians(point["lng"]) * math.cos(origin_latitude_radians),
+        "y": EARTH_RADIUS_METERS * math.radians(point["lat"]),
+    }
+
+
+def segment_bearing_degrees(point_a, point_b):
+    latitude_a_radians = math.radians(point_a["lat"])
+    latitude_b_radians = math.radians(point_b["lat"])
+    longitude_delta = math.radians(point_b["lng"] - point_a["lng"])
+
+    x_value = math.sin(longitude_delta) * math.cos(latitude_b_radians)
+    y_value = (
+        math.cos(latitude_a_radians) * math.sin(latitude_b_radians)
+        - math.sin(latitude_a_radians) * math.cos(latitude_b_radians) * math.cos(longitude_delta)
+    )
+    return normalize_azimuth(math.degrees(math.atan2(x_value, y_value)))
+
+
+def resolve_dominant_roof_edge(roof_selection):
+    points = get_polygon_ring_points((roof_selection or {}).get("geometry"))
+    if len(points) < 2:
+        return None
+
+    origin_latitude = sum(point["lat"] for point in points) / len(points)
+    projected_points = [project_local_point(point, origin_latitude) for point in points]
+    longest_edge = None
+
+    for index, point in enumerate(points):
+        next_point = points[(index + 1) % len(points)]
+        projected_point = projected_points[index]
+        projected_next = projected_points[(index + 1) % len(projected_points)]
+        edge_length_m = math.hypot(
+            projected_next["x"] - projected_point["x"],
+            projected_next["y"] - projected_point["y"],
+        )
+        if edge_length_m < 1:
+            continue
+
+        edge = {
+            "bearing": segment_bearing_degrees(point, next_point),
+            "length_m": round(edge_length_m, 1),
+        }
+        if not longest_edge or edge["length_m"] > longest_edge["length_m"]:
+            longest_edge = edge
+
+    return longest_edge
+
+
+def build_solar_modeling_context(latitude, roof_selection, property_context):
+    dominant_edge = resolve_dominant_roof_edge(roof_selection)
+    terrain_context = (property_context or {}).get("terrain_context") or {}
+    building_context = (property_context or {}).get("building_context") or {}
+    shade_context = (property_context or {}).get("shade_context") or {}
+    terrain_aspect = terrain_context.get("dominant_aspect")
+    preferred_azimuth = aspect_to_azimuth(terrain_aspect) or 180.0
+
+    if dominant_edge:
+        candidate_a = normalize_azimuth(dominant_edge["bearing"] + 90)
+        candidate_b = normalize_azimuth(dominant_edge["bearing"] - 90)
+        assumed_azimuth = (
+            candidate_a
+            if angular_distance_degrees(candidate_a, preferred_azimuth)
+            <= angular_distance_degrees(candidate_b, preferred_azimuth)
+            else candidate_b
+        )
+        azimuth_source = (
+            "roof polygon dominant edge with terrain-aware side selection"
+            if property_context
+            else "roof polygon dominant edge with solar-facing side selection"
+        )
+    else:
+        assumed_azimuth = preferred_azimuth
+        azimuth_source = (
+            "terrain-aware fallback"
+            if property_context and aspect_to_azimuth(terrain_aspect) is not None
+            else "south-facing fallback"
+        )
+
+    base_tilt = estimate_pvwatts_tilt(latitude)
+    terrain_slope_percent = float(terrain_context.get("slope_percent") or 0)
+    terrain_azimuth = aspect_to_azimuth(terrain_aspect)
+    tilt_adjustment = 0.0
+    if terrain_azimuth is not None and terrain_slope_percent > 0:
+        alignment_degrees = angular_distance_degrees(assumed_azimuth, terrain_azimuth)
+        if alignment_degrees <= 45:
+            tilt_adjustment = min(terrain_slope_percent * 0.35, 5.5)
+        elif alignment_degrees >= 135:
+            tilt_adjustment = -min(terrain_slope_percent * 0.2, 3.5)
+
+    assumed_tilt = round(clamp(base_tilt + tilt_adjustment, 8, 45), 1)
+    tilt_source = (
+        "latitude baseline nudged by local terrain aspect"
+        if property_context and terrain_azimuth is not None and terrain_slope_percent > 0
+        else "latitude fallback"
+    )
+
+    directional_pressure = building_context.get("directional_pressure") or {}
+    facing_group = azimuth_to_direction_group(assumed_azimuth)
+    pressure_weights = {
+        "south": {"south": 0.75, "east": 0.18, "west": 0.18, "north": 0.05},
+        "east": {"east": 0.75, "south": 0.18, "north": 0.18, "west": 0.05},
+        "west": {"west": 0.75, "south": 0.18, "north": 0.18, "east": 0.05},
+        "north": {"north": 0.75, "east": 0.18, "west": 0.18, "south": 0.05},
+    }[facing_group]
+    weighted_pressure = sum(
+        float(directional_pressure.get(direction) or 0) * weight
+        for direction, weight in pressure_weights.items()
+    )
+    building_loss_fraction = clamp(weighted_pressure * 0.035, 0.0, 0.12)
+    terrain_bias = shade_context.get("terrain_bias") or "mostly neutral"
+    terrain_loss_adjustment = 0.0
+    if property_context:
+        if terrain_bias == "less solar-favored":
+            terrain_loss_adjustment = 0.02
+        elif terrain_bias == "mostly neutral":
+            terrain_loss_adjustment = 0.01
+
+    site_loss_fraction = clamp(building_loss_fraction + terrain_loss_adjustment, 0.0, 0.16)
+
+    return {
+        "dominant_edge_bearing": dominant_edge.get("bearing") if dominant_edge else None,
+        "dominant_edge_length_m": dominant_edge.get("length_m") if dominant_edge else None,
+        "assumed_azimuth": assumed_azimuth,
+        "assumed_tilt": assumed_tilt,
+        "azimuth_source": azimuth_source,
+        "tilt_source": tilt_source,
+        "site_context_available": bool(property_context),
+        "site_context_summary": (property_context or {}).get("summary"),
+        "site_context_label": ((property_context or {}).get("match_envelope") or {}).get("label"),
+        "site_context_source": ((property_context or {}).get("match_envelope") or {}).get("source"),
+        "obstruction_risk": shade_context.get("obstruction_risk") or building_context.get("obstruction_risk"),
+        "terrain_class": terrain_context.get("terrain_class"),
+        "terrain_aspect": terrain_aspect,
+        "terrain_bias": terrain_bias,
+        "building_pressure_score": round(weighted_pressure, 2),
+        "modeled_site_losses_percent": round(site_loss_fraction * 100, 1),
+        "site_loss_factor": round(1 - site_loss_fraction, 3),
+        "pvwatts_losses_percent": round(NREL_PVWATTS_DEFAULT_LOSSES + (site_loss_fraction * 100), 1),
+    }
+
+
 def normalize_panel_efficiency(panel_efficiency):
     return clamp(float(panel_efficiency or 0.20), 0.15, 0.27)
 
@@ -1197,6 +1400,7 @@ def build_solar_production_model(
     panel_efficiency,
     electricity_rate,
     roof_selection,
+    modeling_context,
 ):
     normalized_efficiency = normalize_panel_efficiency(panel_efficiency)
     loss_factors = {
@@ -1206,6 +1410,7 @@ def build_solar_production_model(
         "availability": 0.99,
         "temperature": resolve_temperature_factor(avg_all_sky_radiation),
         "layout": 0.96 if roof_selection else 0.90,
+        "site_context": modeling_context.get("site_loss_factor", 1.0),
     }
 
     performance_ratio = 1.0
@@ -1237,16 +1442,33 @@ def build_solar_production_model(
     lowest_month = min(monthly_production.items(), key=lambda item: item[1]) if monthly_production else (None, 0)
 
     return {
-        "id": "roof-backed-monthly-v1",
+        "id": "roof-backed-monthly-v2",
         "label": "Roof-backed monthly model",
         "description": (
-            "Uses month-by-month solar resource data, roof-backed DC sizing, and explicit "
-            "system-loss assumptions instead of a single annualized screening multiplier."
+            "Uses month-by-month solar resource data, roof-backed DC sizing, inferred roof-facing "
+            "assumptions, and first-pass site-context losses instead of a single annualized "
+            "screening multiplier."
         ),
         "roof_coverage_factor": ROOF_COVERAGE_FACTOR,
         "effective_panel_efficiency": normalized_efficiency,
         "performance_ratio": performance_ratio,
         "loss_factors": loss_factors,
+        "assumed_tilt": modeling_context.get("assumed_tilt"),
+        "assumed_azimuth": modeling_context.get("assumed_azimuth"),
+        "tilt_source": modeling_context.get("tilt_source"),
+        "azimuth_source": modeling_context.get("azimuth_source"),
+        "site_context_available": modeling_context.get("site_context_available", False),
+        "site_context_summary": modeling_context.get("site_context_summary"),
+        "site_context_label": modeling_context.get("site_context_label"),
+        "site_context_source": modeling_context.get("site_context_source"),
+        "obstruction_risk": modeling_context.get("obstruction_risk"),
+        "terrain_class": modeling_context.get("terrain_class"),
+        "terrain_aspect": modeling_context.get("terrain_aspect"),
+        "terrain_bias": modeling_context.get("terrain_bias"),
+        "building_pressure_score": modeling_context.get("building_pressure_score"),
+        "modeled_site_losses_percent": modeling_context.get("modeled_site_losses_percent"),
+        "dominant_edge_bearing": modeling_context.get("dominant_edge_bearing"),
+        "dominant_edge_length_m": modeling_context.get("dominant_edge_length_m"),
         "monthly_production": monthly_production,
         "monthly_savings": monthly_savings,
         "annual_production": annual_production,
@@ -1269,6 +1491,7 @@ def build_nrel_pvwatts_production_model(
     solar_data,
     panel_efficiency,
     electricity_rate,
+    modeling_context,
 ):
     pvwatts = solar_data.get("pvwatts") or {}
     outputs = pvwatts.get("outputs") or {}
@@ -1296,9 +1519,8 @@ def build_nrel_pvwatts_production_model(
         "id": "nrel-pvwatts-v8",
         "label": "NREL PVWatts V8",
         "description": (
-            "Uses NREL PVWatts V8 with NSRDB weather data, a roof-mounted reference profile, "
-            "latitude-based tilt fallback, and south-facing azimuth fallback because roof pitch, "
-            "azimuth, and shading are not modeled yet."
+            "Uses NREL PVWatts V8 with NSRDB weather data, the drawn roof geometry for azimuth "
+            "selection, a terrain-informed tilt fallback, and first-pass site-context losses."
         ),
         "roof_coverage_factor": ROOF_COVERAGE_FACTOR,
         "effective_panel_efficiency": normalize_panel_efficiency(panel_efficiency),
@@ -1309,6 +1531,20 @@ def build_nrel_pvwatts_production_model(
         },
         "assumed_tilt": round(float(inputs.get("tilt") or 0), 1),
         "assumed_azimuth": round(float(inputs.get("azimuth") or 0), 1),
+        "tilt_source": modeling_context.get("tilt_source"),
+        "azimuth_source": modeling_context.get("azimuth_source"),
+        "site_context_available": modeling_context.get("site_context_available", False),
+        "site_context_summary": modeling_context.get("site_context_summary"),
+        "site_context_label": modeling_context.get("site_context_label"),
+        "site_context_source": modeling_context.get("site_context_source"),
+        "obstruction_risk": modeling_context.get("obstruction_risk"),
+        "terrain_class": modeling_context.get("terrain_class"),
+        "terrain_aspect": modeling_context.get("terrain_aspect"),
+        "terrain_bias": modeling_context.get("terrain_bias"),
+        "building_pressure_score": modeling_context.get("building_pressure_score"),
+        "modeled_site_losses_percent": round(float(losses or 0) - NREL_PVWATTS_DEFAULT_LOSSES, 1),
+        "dominant_edge_bearing": modeling_context.get("dominant_edge_bearing"),
+        "dominant_edge_length_m": modeling_context.get("dominant_edge_length_m"),
         "weather_data_source": (pvwatts.get("station_info") or {}).get("weather_data_source"),
         "warnings": pvwatts.get("warnings") or [],
         "monthly_production": monthly_production,
@@ -1355,9 +1591,9 @@ def build_solar_assumptions(
     if solar_provider == "nrel-pvwatts":
         production_assumption = (
             "Production uses NREL PVWatts V8 with NSRDB weather data, a roof-mounted array type, "
-            f"{production_model.get('assumed_tilt', 0):.0f}° tilt, "
-            f"{production_model.get('assumed_azimuth', 180):.0f}° azimuth, and "
-            f"{NREL_PVWATTS_DEFAULT_LOSSES:.0f}% aggregate system losses."
+            f"{production_model.get('assumed_tilt', 0):.0f}° tilt from {production_model.get('tilt_source') or 'fallback inputs'}, "
+            f"{production_model.get('assumed_azimuth', 180):.0f}° azimuth from {production_model.get('azimuth_source') or 'fallback inputs'}, and "
+            f"{NREL_PVWATTS_DEFAULT_LOSSES + (production_model.get('modeled_site_losses_percent') or 0):.0f}% aggregate system losses."
         )
         data_source_assumption = (
             "Solar resource and production modeling use NREL PVWatts V8; cache layers only change "
@@ -1372,16 +1608,29 @@ def build_solar_assumptions(
             f"Solar resource data source is {data_source or 'unknown'} with {data_quality} quality."
         )
 
-    return [
+    assumptions = [
         system_size_assumption,
         production_assumption,
         f"Panel efficiency is assumed at {normalized_efficiency * 100:.0f}%.",
         f"Electricity rate is assumed at ${electricity_rate:.2f}/kWh.",
         f"Installed cost is assumed at ${installation_cost_per_watt:.2f}/W.",
         data_source_assumption,
-        "Shading, azimuth, roof pitch, utility tariff detail, and roof obstructions are not modeled yet.",
-        "This is a stronger planning model, but it is still not an installer quote or permit-ready design.",
     ]
+
+    if production_model.get("site_context_available"):
+        assumptions.append(
+            f"Nearby building and terrain context contribute about {production_model.get('modeled_site_losses_percent', 0):.1f}% extra modeled site losses in this planning pass."
+        )
+    else:
+        assumptions.append(
+            "Site-context losses still use a generic fallback because no saved property context is available yet."
+        )
+
+    assumptions.extend([
+        "Trees, fences, utility tariff detail, and parcel-certified roof pitch are not modeled yet.",
+        "This is a stronger planning model, but it is still not an installer quote or permit-ready design.",
+    ])
+    return assumptions
 
 
 def build_solar_confidence(
@@ -1406,12 +1655,19 @@ def build_solar_confidence(
     if solar_provider == "nrel-pvwatts":
         score += 12
         factors.append("Production uses NREL PVWatts V8 with NSRDB weather data.")
-        factors.append("Roof pitch, azimuth, and shading still use generic assumptions.")
+        if production_model.get("site_context_available"):
+            score += 6
+            factors.append("Roof-facing inputs and site losses are refined from the drawn roof and saved property context.")
+        else:
+            factors.append("Roof-facing inputs still use generic fallbacks because saved site context is missing.")
     elif production_model:
         score += 8
         factors.append(
             "Production uses month-by-month solar resource data and explicit system-loss assumptions."
         )
+        if production_model.get("site_context_available"):
+            score += 5
+            factors.append("Nearby building and terrain context temper the production model for this property.")
 
     if match_quality == "high":
         score += 18
@@ -1598,7 +1854,12 @@ def build_solar_estimate_response(input_data):
 
     if not solar_data:
         lat, lon = geocode_address(address)
-        solar_data, fresh_data_source = get_fresh_solar_data(lat, lon)
+        if get_nrel_api_key():
+            solar_data = get_nasa_power_data(lat, lon)
+            solar_data["provider"] = "nasa"
+            fresh_data_source = "nasa"
+        else:
+            solar_data, fresh_data_source = get_fresh_solar_data(lat, lon)
         time_zone = get_timezone(lat, lon)
         store_solar_data(guid, solar_data, time_zone, address, fresh_data_source)
         data_source = fresh_data_source
@@ -1608,17 +1869,47 @@ def build_solar_estimate_response(input_data):
     if lat is None or lon is None:
         raise HTTPException(status_code=500, detail="Unable to determine latitude and longitude")
 
-    solar_provider = resolve_solar_provider(solar_data)
-    avg_all_sky_radiation = round(solar_data.get("avg_all_sky_radiation", 0), 2)
-    avg_clear_sky_radiation = round(solar_data.get("avg_clear_sky_radiation", 0), 2)
-    all_sky_data_quality = normalize_quality_percent(solar_data.get("all_sky_data_quality", 0))
-    clear_sky_data_quality = normalize_quality_percent(solar_data.get("clear_sky_data_quality", 0))
+    property_context = property_record.get("property_context")
+    modeling_context = build_solar_modeling_context(
+        lat,
+        roof_selection,
+        property_context,
+    )
+
+    estimate_solar_data = solar_data
+    estimate_data_source = data_source
+    if get_nrel_api_key():
+        try:
+            estimate_solar_data = get_nrel_pvwatts_data(
+                lat,
+                lon,
+                tilt=modeling_context.get("assumed_tilt"),
+                azimuth=modeling_context.get("assumed_azimuth"),
+                losses=modeling_context.get("pvwatts_losses_percent"),
+            )
+            estimate_data_source = "nrel-pvwatts"
+        except HTTPException as exc:
+            logger.warning(
+                "Refined NREL PVWatts estimate unavailable, falling back to cached solar data: %s",
+                exc.detail,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Refined NREL PVWatts estimate unavailable, falling back to cached solar data: %s",
+                str(exc),
+            )
+
+    solar_provider = resolve_solar_provider(estimate_solar_data)
+    avg_all_sky_radiation = round(estimate_solar_data.get("avg_all_sky_radiation", 0), 2)
+    avg_clear_sky_radiation = round(estimate_solar_data.get("avg_clear_sky_radiation", 0), 2)
+    all_sky_data_quality = normalize_quality_percent(estimate_solar_data.get("all_sky_data_quality", 0))
+    clear_sky_data_quality = normalize_quality_percent(estimate_solar_data.get("clear_sky_data_quality", 0))
     monthly_all_sky = {
-        str(i).zfill(2): round(solar_data.get("monthly_all_sky", {}).get(str(i).zfill(2), 0), 2)
+        str(i).zfill(2): round(estimate_solar_data.get("monthly_all_sky", {}).get(str(i).zfill(2), 0), 2)
         for i in range(1, 13)
     }
     monthly_clear_sky = {
-        str(i).zfill(2): round(solar_data.get("monthly_clear_sky", {}).get(str(i).zfill(2), 0), 2)
+        str(i).zfill(2): round(estimate_solar_data.get("monthly_clear_sky", {}).get(str(i).zfill(2), 0), 2)
         for i in range(1, 13)
     }
     best_all_sky = round(max(monthly_all_sky.values()), 2) if monthly_all_sky else 0
@@ -1627,16 +1918,17 @@ def build_solar_estimate_response(input_data):
     worst_clear_sky = round(min(monthly_clear_sky.values()), 2) if monthly_clear_sky else 0
 
     has_pvwatts_profile = bool(
-        ((solar_data.get("pvwatts") or {}).get("outputs") or {}).get("ac_monthly_per_kw")
+        ((estimate_solar_data.get("pvwatts") or {}).get("outputs") or {}).get("ac_monthly_per_kw")
     )
     model_provider = solar_provider if solar_provider == "nrel-pvwatts" and has_pvwatts_profile else "nasa"
 
     if model_provider == "nrel-pvwatts":
         production_model = build_nrel_pvwatts_production_model(
             system_size_kw,
-            solar_data,
+            estimate_solar_data,
             input_data.panel_efficiency,
             input_data.electricity_rate,
+            modeling_context,
         )
     else:
         production_model = build_solar_production_model(
@@ -1646,6 +1938,7 @@ def build_solar_estimate_response(input_data):
             input_data.panel_efficiency,
             input_data.electricity_rate,
             roof_selection,
+            modeling_context,
         )
     annual_production = production_model["annual_production"]
     daily_production = production_model["daily_production"]
@@ -1670,7 +1963,7 @@ def build_solar_estimate_response(input_data):
         input_data.panel_efficiency,
         input_data.electricity_rate,
         input_data.installation_cost_per_watt,
-        data_source or "unknown",
+        estimate_data_source or "unknown",
         model_provider,
         overall_quality,
         production_model,
@@ -1679,7 +1972,7 @@ def build_solar_estimate_response(input_data):
         match_quality,
         overall_quality,
         sizing_source,
-        data_source or "unknown",
+        estimate_data_source or "unknown",
         model_provider,
         roof_selection,
         production_model,
@@ -1722,7 +2015,7 @@ def build_solar_estimate_response(input_data):
         "peak_month": production_model["peak_month"],
         "lowest_month": production_model["lowest_month"],
         "time_zone": time_zone,
-        "data_source": data_source or "unknown",
+        "data_source": estimate_data_source or "unknown",
         "data_provider": solar_provider,
         "data_quality": overall_quality,
     }
@@ -1872,7 +2165,7 @@ def reverse_geocode_property(coordinates: Coordinates):
     "/api/property-context",
     response_model=dict,
     summary="Get Property Context",
-    description="Returns first-pass building and terrain context around the property for Garden Buddy.",
+    description="Returns first-pass building and terrain context around the property for Solar Buddy and Garden Buddy.",
 )
 def get_property_context(payload: PropertyContextRequest):
     try:
@@ -1932,6 +2225,19 @@ def get_surface_irradiance(coordinates: Coordinates):
     except Exception as exc:
         logger.error("Surface irradiance processing failed: %s", str(exc))
         raise HTTPException(status_code=500, detail="Unable to process surface irradiance data")
+
+
+@app.post(
+    "/api/garden-crop-catalog",
+    response_model=dict,
+    summary="Get Garden Crop Catalog",
+    description="Returns the persisted zone-aware crop catalog used by Garden Buddy recommendations.",
+)
+def fetch_garden_crop_catalog():
+    payload = get_garden_crop_catalog("default")
+    if not payload:
+        raise HTTPException(status_code=404, detail="Garden crop catalog unavailable")
+    return payload
 
 
 @app.post(

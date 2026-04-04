@@ -1,3 +1,4 @@
+import copy
 import unittest
 from unittest.mock import patch
 
@@ -52,6 +53,25 @@ def build_roof_selection():
         "areaSquareMeters": 92.9,
         "areaSquareFeet": 1000,
         "recommendedKw": 10.5,
+    }
+
+
+def build_west_facing_roof_selection():
+    return {
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [-97.7434, 30.2678],
+                [-97.7431, 30.2678],
+                [-97.7431, 30.2670],
+                [-97.7434, 30.2670],
+                [-97.7434, 30.2678],
+            ]],
+        },
+        "centroid": {"lat": 30.2674, "lng": -97.74325},
+        "areaSquareMeters": 84.0,
+        "areaSquareFeet": 904,
+        "recommendedKw": 9.5,
     }
 
 
@@ -156,6 +176,15 @@ def build_property_context():
     }
 
 
+def build_west_facing_property_context():
+    context = copy.deepcopy(build_property_context())
+    context["terrain_context"]["dominant_aspect"] = "west-facing"
+    context["terrain_context"]["summary"] = "Local terrain reads as rolling with a west-facing bias."
+    context["shade_context"]["terrain_bias"] = "mostly neutral"
+    context["summary"] = "2 nearby building footprints found. Local terrain reads as rolling with a west-facing bias."
+    return context
+
+
 def build_solar_data(latitude=30.2672, longitude=-97.7431):
     return {
         "avg_all_sky_radiation": 5.25,
@@ -176,7 +205,7 @@ def build_solar_data(latitude=30.2672, longitude=-97.7431):
     }
 
 
-def build_nrel_solar_data(latitude=30.2672, longitude=-97.7431):
+def build_nrel_solar_data(latitude=30.2672, longitude=-97.7431, tilt=30.3, azimuth=180.0, losses=14.0):
     monthly_all_sky = {
         "01": 4.21,
         "02": 4.88,
@@ -222,10 +251,10 @@ def build_nrel_solar_data(latitude=30.2672, longitude=-97.7431):
             "inputs": {
                 "system_capacity": 1.0,
                 "module_type": 0,
-                "losses": 14.0,
+                "losses": losses,
                 "array_type": 1,
-                "tilt": 30.3,
-                "azimuth": 180.0,
+                "tilt": tilt,
+                "azimuth": azimuth,
                 "dataset": "nsrdb",
                 "radius": 0,
                 "inv_eff": 96.0,
@@ -519,13 +548,59 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertEqual(payload["confidence"]["id"], "high")
         self.assertTrue(payload["confidence"]["factors"])
         self.assertTrue(payload["assumptions"])
-        self.assertEqual(payload["production_model"]["id"], "roof-backed-monthly-v1")
+        self.assertEqual(payload["production_model"]["id"], "roof-backed-monthly-v2")
         self.assertEqual(payload["data_provider"], "nasa")
         self.assertEqual(payload["production_model"]["peak_month"]["month"], "01")
         self.assertAlmostEqual(payload["monthly_production"]["01"], 1363.7, places=1)
         self.assertGreater(payload["annual_production"], 16000)
         self.assertGreater(payload["specific_yield"], 1500)
         self.assertGreater(payload["capacity_factor"], 0.17)
+
+    def test_solar_potential_uses_saved_property_context_for_site_losses(self):
+        property_response = self.client.post(
+            "/api/property-record",
+            json={
+                "address": build_address(),
+                "property_preview": build_property_preview(),
+                "property_context": build_property_context(),
+                "roof_selection": build_roof_selection(),
+            },
+        )
+        guid = property_response.json()["guid"]
+
+        with patch.object(main, "get_nrel_api_key", return_value=None):
+            with patch.object(main, "check_existing_zip_data", return_value=(None, None)):
+                with patch.object(main, "geocode_address", return_value=(30.2672, -97.7431)):
+                    with patch.object(main, "get_nasa_power_data", return_value=build_solar_data()):
+                        with patch.object(main, "get_timezone", return_value="America/Chicago"):
+                            response = self.client.post(
+                                "/api/solar-potential",
+                                json={
+                                    "guid": guid,
+                                    "panel_efficiency": 0.2,
+                                    "electricity_rate": 0.16,
+                                    "installation_cost_per_watt": 3.0,
+                                },
+                            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["production_model"]["id"], "roof-backed-monthly-v2")
+        self.assertTrue(payload["production_model"]["site_context_available"])
+        self.assertEqual(payload["production_model"]["assumed_azimuth"], 180.0)
+        self.assertEqual(
+            payload["production_model"]["tilt_source"],
+            "latitude baseline nudged by local terrain aspect",
+        )
+        self.assertGreater(payload["production_model"]["modeled_site_losses_percent"], 0)
+        self.assertLess(payload["monthly_production"]["01"], 1363.7)
+        self.assertTrue(
+            any(
+                "Nearby building and terrain context contribute about"
+                in assumption
+                for assumption in payload["assumptions"]
+            )
+        )
 
     def test_solar_potential_prefers_nrel_pvwatts_when_api_key_is_available(self):
         property_response = self.client.post(
@@ -567,6 +642,53 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertAlmostEqual(payload["capacity_factor"], 0.1594, places=4)
         self.assertEqual(payload["peak_month"]["month"], "07")
 
+    def test_solar_potential_requests_refined_nrel_inputs_from_roof_and_context(self):
+        property_response = self.client.post(
+            "/api/property-record",
+            json={
+                "address": build_address(),
+                "property_preview": build_property_preview(),
+                "property_context": build_west_facing_property_context(),
+                "roof_selection": build_west_facing_roof_selection(),
+            },
+        )
+        guid = property_response.json()["guid"]
+
+        with patch.object(main, "get_nrel_api_key", return_value="test-key"):
+            with patch.object(main, "check_existing_zip_data", return_value=(None, None)):
+                with patch.object(main, "geocode_address", return_value=(30.2672, -97.7431)):
+                    with patch.object(
+                        main,
+                        "get_nrel_pvwatts_data",
+                        side_effect=lambda lat, lon, tilt=None, azimuth=None, losses=None: build_nrel_solar_data(
+                            latitude=lat,
+                            longitude=lon,
+                            tilt=tilt or 30.3,
+                            azimuth=azimuth or 180.0,
+                            losses=losses or 14.0,
+                        ),
+                    ) as mocked_pvwatts:
+                        with patch.object(main, "get_timezone", return_value="America/Chicago"):
+                            response = self.client.post(
+                                "/api/solar-potential",
+                                json={
+                                    "guid": guid,
+                                    "panel_efficiency": 0.2,
+                                    "electricity_rate": 0.16,
+                                    "installation_cost_per_watt": 3.0,
+                                },
+                            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(mocked_pvwatts.call_count, 1)
+        self.assertEqual(mocked_pvwatts.call_args.kwargs["azimuth"], 270.0)
+        self.assertAlmostEqual(mocked_pvwatts.call_args.kwargs["tilt"], 32.8, places=1)
+        self.assertGreater(mocked_pvwatts.call_args.kwargs["losses"], 14.0)
+        self.assertEqual(payload["production_model"]["assumed_azimuth"], 270.0)
+        self.assertAlmostEqual(payload["production_model"]["assumed_tilt"], 32.8, places=1)
+        self.assertTrue(payload["production_model"]["site_context_available"])
+
     def test_save_solar_report_persists_snapshot_to_property_record(self):
         property_response = self.client.post(
             "/api/property-record",
@@ -596,7 +718,7 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(len(payload["reports"]), 1)
-        self.assertEqual(payload["report"]["production_model"]["id"], "roof-backed-monthly-v1")
+        self.assertEqual(payload["report"]["production_model"]["id"], "roof-backed-monthly-v2")
         self.assertEqual(payload["estimate"]["system_size_kw"], 10.5)
 
         record = data_persistence.get_property_record(guid)
@@ -700,6 +822,28 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertEqual(payload["annual"]["average_temperature_f"], 71.2)
         self.assertEqual(payload["growing_season"]["average_relative_humidity"], 62.0)
         mocked_snapshot.assert_called_once_with(30.2672, -97.7431, "America/Chicago")
+
+    def test_garden_crop_catalog_is_seeded_into_persistence(self):
+        payload = data_persistence.get_garden_crop_catalog()
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["catalog_id"], "default")
+        self.assertEqual(payload["version"], "2026-04-03")
+        self.assertTrue(payload["stored_at"])
+        self.assertGreater(len(payload["crops"]), 20)
+        self.assertTrue(any(crop["id"] == "tomato" for crop in payload["crops"]))
+        self.assertTrue(any(source["id"] == "usda-hardiness-map" for source in payload["source_basis"]))
+
+    def test_garden_crop_catalog_endpoint_returns_persisted_catalog(self):
+        response = self.client.post("/api/garden-crop-catalog", json={})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["catalog_id"], "default")
+        self.assertEqual(payload["version"], "2026-04-03")
+        self.assertGreater(len(payload["crops"]), 20)
+        tomato = next(crop for crop in payload["crops"] if crop["id"] == "tomato")
+        self.assertEqual(tomato["sun"]["primary"], ["full-sun"])
 
     def test_property_context_endpoint_returns_snapshot(self):
         context_snapshot = build_property_context()
