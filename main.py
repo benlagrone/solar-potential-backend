@@ -12,6 +12,7 @@ from data_persistence import (
     check_existing_address_data, check_existing_solar_data, check_existing_zip_data,
     find_property_record_by_address, find_solar_quote, get_property_record, list_property_records,
     upsert_property_record, get_garden_crop_catalog,
+    get_cached_property_climate, store_cached_property_climate,
     build_address_lookup_key, build_coordinate_lookup_key, get_geocode_cache, store_geocode_cache,
 )
 from property_context import get_property_context_snapshot
@@ -94,6 +95,7 @@ class PropertyRecordRequest(BaseModel):
     address: Address
     property_preview: Optional[dict] = None
     property_context: Optional[dict] = None
+    property_climate: Optional[dict] = None
     roof_selection: Optional[RoofSelection] = None
     garden_zones: Optional[list[GardenZone]] = None
 
@@ -129,6 +131,7 @@ class SolarQuoteRequest(BaseModel):
 class Coordinates(BaseModel):
     latitude: float
     longitude: float
+    force_refresh: bool = False
 
 
 class PropertyContextRequest(BaseModel):
@@ -2066,6 +2069,7 @@ def save_property_record(payload: PropertyRecordRequest):
     upsert_kwargs = {
         "property_preview": property_preview,
         "property_context": payload.property_context,
+        "property_climate": payload.property_climate,
         "roof_selection": roof_selection,
     }
     if garden_zones is not None:
@@ -2079,6 +2083,7 @@ def save_property_record(payload: PropertyRecordRequest):
         "address": saved_record.get("address", address),
         "property_preview": saved_record.get("property_preview", property_preview),
         "property_context": saved_record.get("property_context", payload.property_context),
+        "property_climate": saved_record.get("property_climate", payload.property_climate),
         "roof_selection": saved_record.get("roof_selection", roof_selection),
         "garden_zones": saved_record.get("garden_zones", garden_zones or []),
         "saved_solar_reports": saved_record.get("saved_solar_reports", []),
@@ -2196,6 +2201,7 @@ def get_space_weather(coordinates: Coordinates):
             coordinates.latitude,
             coordinates.longitude,
             time_zone,
+            force_refresh=coordinates.force_refresh,
         )
     except requests.HTTPError as exc:
         logger.error("Space weather upstream request failed: %s", str(exc))
@@ -2218,6 +2224,7 @@ def get_surface_irradiance(coordinates: Coordinates):
             coordinates.latitude,
             coordinates.longitude,
             time_zone,
+            force_refresh=coordinates.force_refresh,
         )
     except requests.HTTPError as exc:
         logger.error("Surface irradiance upstream request failed: %s", str(exc))
@@ -2247,13 +2254,27 @@ def fetch_garden_crop_catalog():
     description="Returns historical climate context and an estimated hardiness band for the provided coordinates.",
 )
 def get_property_climate(coordinates: Coordinates):
+    if not coordinates.force_refresh:
+        cached_snapshot = get_cached_property_climate(
+            coordinates.latitude,
+            coordinates.longitude,
+        )
+        if cached_snapshot:
+            return cached_snapshot
+
     time_zone = get_timezone(coordinates.latitude, coordinates.longitude) or "UTC"
     try:
-        return get_property_climate_snapshot(
+        snapshot = get_property_climate_snapshot(
             coordinates.latitude,
             coordinates.longitude,
             time_zone,
         )
+        store_cached_property_climate(
+            coordinates.latitude,
+            coordinates.longitude,
+            snapshot,
+        )
+        return snapshot
     except requests.HTTPError as exc:
         logger.error("Property climate upstream request failed: %s", str(exc))
         raise HTTPException(status_code=502, detail="Unable to load property climate data")

@@ -14,6 +14,7 @@ _solar_data_memory = {}
 _property_record_memory = {}
 _geocode_cache_memory = {}
 _garden_crop_catalog_memory = {}
+_property_climate_snapshot_memory = {}
 _UNSET = object()
 _RECENT_CACHE_DAYS = 30
 
@@ -84,6 +85,7 @@ def _initialize_db(connection):
             address_json TEXT NOT NULL,
             property_preview_json TEXT,
             property_context_json TEXT,
+            property_climate_json TEXT,
             roof_selection_json TEXT,
             garden_zones_json TEXT NOT NULL,
             saved_solar_reports_json TEXT NOT NULL,
@@ -133,6 +135,12 @@ def _initialize_db(connection):
             payload_json TEXT NOT NULL,
             stored_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS property_climate_snapshots (
+            coordinate_lookup_key TEXT PRIMARY KEY,
+            climate_json TEXT NOT NULL,
+            stored_at TEXT NOT NULL
+        );
         """
     )
     columns = {
@@ -141,6 +149,8 @@ def _initialize_db(connection):
     }
     if "property_context_json" not in columns:
         connection.execute("ALTER TABLE property_records ADD COLUMN property_context_json TEXT")
+    if "property_climate_json" not in columns:
+        connection.execute("ALTER TABLE property_records ADD COLUMN property_climate_json TEXT")
     _seed_garden_crop_catalog(connection)
     connection.commit()
 
@@ -165,6 +175,7 @@ def _build_property_record_from_row(row):
         "address": _json_load(row["address_json"], default={}) or {},
         "property_preview": _json_load(row["property_preview_json"]),
         "property_context": _json_load(row["property_context_json"]),
+        "property_climate": _json_load(row["property_climate_json"]),
         "roof_selection": _json_load(row["roof_selection_json"]),
         "stored_at": row["stored_at"],
         "garden_zones": _json_load(row["garden_zones_json"], default=[]) or [],
@@ -246,6 +257,7 @@ def _write_property_record(
     address,
     property_preview,
     property_context,
+    property_climate,
     roof_selection,
     garden_zones,
     saved_solar_reports,
@@ -259,17 +271,19 @@ def _write_property_record(
             address_json,
             property_preview_json,
             property_context_json,
+            property_climate_json,
             roof_selection_json,
             garden_zones_json,
             saved_solar_reports_json,
             stored_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(guid) DO UPDATE SET
             address_lookup_key = excluded.address_lookup_key,
             address_json = excluded.address_json,
             property_preview_json = excluded.property_preview_json,
             property_context_json = excluded.property_context_json,
+            property_climate_json = excluded.property_climate_json,
             roof_selection_json = excluded.roof_selection_json,
             garden_zones_json = excluded.garden_zones_json,
             saved_solar_reports_json = excluded.saved_solar_reports_json,
@@ -281,6 +295,7 @@ def _write_property_record(
             json.dumps(address),
             _json_dump(property_preview),
             _json_dump(property_context),
+            _json_dump(property_climate),
             _json_dump(roof_selection),
             json.dumps(garden_zones or []),
             json.dumps(saved_solar_reports or []),
@@ -295,6 +310,7 @@ def _write_property_record(
         "address": dict(address),
         "property_preview": property_preview,
         "property_context": property_context,
+        "property_climate": property_climate,
         "roof_selection": roof_selection,
         "garden_zones": garden_zones or [],
         "saved_solar_reports": saved_solar_reports or [],
@@ -309,6 +325,7 @@ def reset_memory_storage():
     _property_record_memory.clear()
     _geocode_cache_memory.clear()
     _garden_crop_catalog_memory.clear()
+    _property_climate_snapshot_memory.clear()
 
     try:
         with _connect() as connection:
@@ -317,6 +334,7 @@ def reset_memory_storage():
             connection.execute("DELETE FROM geocode_cache")
             connection.execute("DELETE FROM property_records")
             connection.execute("DELETE FROM garden_crop_catalogs")
+            connection.execute("DELETE FROM property_climate_snapshots")
             connection.commit()
     except sqlite3.Error as exc:
         logger.warning("Unable to reset SQLite persistence: %s", str(exc))
@@ -476,6 +494,7 @@ def store_personal_info(guid, address):
                 address,
                 existing_record.get("property_preview"),
                 existing_record.get("property_context"),
+                existing_record.get("property_climate"),
                 existing_record.get("roof_selection"),
                 existing_record.get("garden_zones") or [],
                 existing_record.get("saved_solar_reports") or [],
@@ -491,6 +510,7 @@ def store_personal_info(guid, address):
         "address": dict(address),
         "property_preview": existing_record.get("property_preview"),
         "property_context": existing_record.get("property_context"),
+        "property_climate": existing_record.get("property_climate"),
         "roof_selection": existing_record.get("roof_selection"),
         "garden_zones": existing_record.get("garden_zones") or [],
         "saved_solar_reports": existing_record.get("saved_solar_reports") or [],
@@ -503,6 +523,7 @@ def upsert_property_record(
     address,
     property_preview=None,
     property_context=_UNSET,
+    property_climate=_UNSET,
     roof_selection=None,
     garden_zones=_UNSET,
     saved_solar_reports=_UNSET,
@@ -512,6 +533,10 @@ def upsert_property_record(
         property_context_to_store = existing_record.get("property_context")
     else:
         property_context_to_store = property_context
+    if property_climate is _UNSET:
+        property_climate_to_store = existing_record.get("property_climate")
+    else:
+        property_climate_to_store = property_climate
     if garden_zones is _UNSET:
         garden_zones_to_store = existing_record.get("garden_zones") or []
     else:
@@ -530,6 +555,7 @@ def upsert_property_record(
                 address,
                 property_preview,
                 property_context_to_store,
+                property_climate_to_store,
                 roof_selection,
                 garden_zones_to_store,
                 saved_solar_reports_to_store,
@@ -545,6 +571,7 @@ def upsert_property_record(
         "address": dict(address),
         "property_preview": property_preview,
         "property_context": property_context_to_store,
+        "property_climate": property_climate_to_store,
         "roof_selection": roof_selection,
         "garden_zones": garden_zones_to_store,
         "saved_solar_reports": saved_solar_reports_to_store,
@@ -681,6 +708,62 @@ def check_existing_zip_data(zip_code):
             return cached["solar_data"], cached["time_zone"]
 
     return None, None
+
+
+def get_cached_property_climate(latitude, longitude):
+    if latitude is None or longitude is None:
+        return None
+
+    coordinate_lookup_key = build_coordinate_lookup_key(latitude, longitude)
+    try:
+        with _connect() as connection:
+            row = connection.execute(
+                """
+                SELECT climate_json, stored_at
+                FROM property_climate_snapshots
+                WHERE coordinate_lookup_key = ?
+                """,
+                (coordinate_lookup_key,),
+            ).fetchone()
+        if row and _is_recent(row["stored_at"]):
+            return _json_load(row["climate_json"], default={})
+    except sqlite3.Error as exc:
+        logger.warning("Property climate lookup fell back to memory: %s", str(exc))
+
+    cached = _property_climate_snapshot_memory.get(coordinate_lookup_key)
+    if cached and _is_recent(cached.get("stored_at")):
+        return cached.get("climate")
+
+    return None
+
+
+def store_cached_property_climate(latitude, longitude, climate):
+    if latitude is None or longitude is None or climate is None:
+        return
+
+    coordinate_lookup_key = build_coordinate_lookup_key(latitude, longitude)
+    stored_at = _stored_at_value()
+    try:
+        with _connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO property_climate_snapshots (coordinate_lookup_key, climate_json, stored_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(coordinate_lookup_key) DO UPDATE SET
+                    climate_json = excluded.climate_json,
+                    stored_at = excluded.stored_at
+                """,
+                (coordinate_lookup_key, json.dumps(climate), stored_at),
+            )
+            connection.commit()
+        return
+    except sqlite3.Error as exc:
+        logger.warning("Property climate persistence fell back to memory: %s", str(exc))
+
+    _property_climate_snapshot_memory[coordinate_lookup_key] = {
+        "climate": climate,
+        "stored_at": stored_at,
+    }
 
 
 def get_geocode_cache(query_type, cache_key):

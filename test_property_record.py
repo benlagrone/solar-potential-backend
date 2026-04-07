@@ -185,6 +185,47 @@ def build_west_facing_property_context():
     return context
 
 
+def build_property_climate():
+    return {
+        "hardiness_zone": {
+            "label": "9a",
+            "average_annual_extreme_min_f": 22.4,
+            "range_f": "20 to 25°F",
+            "estimated": True,
+        },
+        "annual": {
+            "average_temperature_f": 71.2,
+            "average_relative_humidity": 68.0,
+            "average_daily_shortwave_radiation_kwh_m2": 4.95,
+        },
+        "growing_season": {
+            "label": "April-September",
+            "average_temperature_f": 82.1,
+            "average_relative_humidity": 62.0,
+            "average_daily_shortwave_radiation_kwh_m2": 6.11,
+        },
+        "frost_window": {
+            "model_version": "frost-window-v1",
+            "threshold_f": 32.0,
+            "last_spring_frost": {
+                "median_day_of_year": 58,
+                "median_label": "Feb 27",
+                "sample_years": 9,
+            },
+            "first_fall_frost": {
+                "median_day_of_year": 339,
+                "median_label": "Dec 5",
+                "sample_years": 8,
+            },
+            "median_frost_free_days": 281,
+            "confidence": "medium",
+            "sample_years": 10,
+            "summary": "Typical 32°F frost window runs from about Feb 27 to Dec 5, leaving roughly 281 frost-free days.",
+        },
+        "summary": "Estimated hardiness band 9a using 2016-2025 historical weather. Typical 32°F frost window runs from about Feb 27 to Dec 5, leaving roughly 281 frost-free days.",
+    }
+
+
 def build_solar_data(latitude=30.2672, longitude=-97.7431):
     return {
         "avg_all_sky_radiation": 5.25,
@@ -342,6 +383,34 @@ class PropertyRecordTests(unittest.TestCase):
 
         record = data_persistence.get_property_record(payload["guid"])
         self.assertEqual(record["property_context"]["terrain_context"]["terrain_class"], "rolling")
+
+    def test_property_record_endpoint_persists_property_climate(self):
+        response = self.client.post(
+            "/api/property-record",
+            json={
+                "address": build_address(),
+                "property_preview": build_property_preview(),
+                "property_climate": build_property_climate(),
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["property_climate"]["hardiness_zone"]["label"], "9a")
+        self.assertEqual(payload["property_climate"]["frost_window"]["last_spring_frost"]["median_label"], "Feb 27")
+
+        record = data_persistence.get_property_record(payload["guid"])
+        self.assertEqual(record["property_climate"]["frost_window"]["median_frost_free_days"], 281)
+        self.assertEqual(record["property_climate"]["annual"]["average_temperature_f"], 71.2)
+
+    def test_property_climate_cache_round_trip_in_persistence(self):
+        climate_snapshot = build_property_climate()
+
+        data_persistence.store_cached_property_climate(30.2672, -97.7431, climate_snapshot)
+
+        cached_snapshot = data_persistence.get_cached_property_climate(30.2672, -97.7431)
+        self.assertEqual(cached_snapshot["hardiness_zone"]["label"], "9a")
+        self.assertEqual(cached_snapshot["frost_window"]["first_fall_frost"]["median_label"], "Dec 5")
 
     def test_property_record_endpoint_preserves_garden_zones_when_updating_roof(self):
         first_response = self.client.post(
@@ -785,29 +854,35 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertEqual(public_quote_payload["address"]["street"], "123 Main St")
 
     def test_property_climate_endpoint_returns_snapshot(self):
-        climate_snapshot = {
-            "hardiness_zone": {
-                "label": "9a",
-                "average_annual_extreme_min_f": 22.4,
-                "range_f": "20 to 25°F",
-                "estimated": True,
-            },
-            "annual": {
-                "average_temperature_f": 71.2,
-                "average_relative_humidity": 68.0,
-                "average_daily_shortwave_radiation_kwh_m2": 4.95,
-            },
-            "growing_season": {
-                "label": "April-September",
-                "average_temperature_f": 82.1,
-                "average_relative_humidity": 62.0,
-                "average_daily_shortwave_radiation_kwh_m2": 6.11,
-            },
-            "summary": "Estimated hardiness band 9a using 2016-2025 historical weather.",
-        }
+        climate_snapshot = build_property_climate()
 
-        with patch.object(main, "get_timezone", return_value="America/Chicago"):
-            with patch.object(main, "get_property_climate_snapshot", return_value=climate_snapshot) as mocked_snapshot:
+        with patch.object(main, "get_cached_property_climate", return_value=None):
+            with patch.object(main, "get_timezone", return_value="America/Chicago"):
+                with patch.object(main, "get_property_climate_snapshot", return_value=climate_snapshot) as mocked_snapshot:
+                    with patch.object(main, "store_cached_property_climate") as mocked_store:
+                        response = self.client.post(
+                            "/api/property-climate",
+                            json={
+                                "latitude": 30.2672,
+                                "longitude": -97.7431,
+                            },
+                        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["hardiness_zone"]["label"], "9a")
+        self.assertEqual(payload["annual"]["average_temperature_f"], 71.2)
+        self.assertEqual(payload["growing_season"]["average_relative_humidity"], 62.0)
+        self.assertEqual(payload["frost_window"]["last_spring_frost"]["median_label"], "Feb 27")
+        self.assertEqual(payload["frost_window"]["median_frost_free_days"], 281)
+        mocked_snapshot.assert_called_once_with(30.2672, -97.7431, "America/Chicago")
+        mocked_store.assert_called_once_with(30.2672, -97.7431, climate_snapshot)
+
+    def test_property_climate_endpoint_returns_cached_snapshot_when_available(self):
+        climate_snapshot = build_property_climate()
+
+        with patch.object(main, "get_cached_property_climate", return_value=climate_snapshot) as mocked_cache:
+            with patch.object(main, "get_property_climate_snapshot") as mocked_snapshot:
                 response = self.client.post(
                     "/api/property-climate",
                     json={
@@ -818,10 +893,9 @@ class PropertyRecordTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["hardiness_zone"]["label"], "9a")
-        self.assertEqual(payload["annual"]["average_temperature_f"], 71.2)
-        self.assertEqual(payload["growing_season"]["average_relative_humidity"], 62.0)
-        mocked_snapshot.assert_called_once_with(30.2672, -97.7431, "America/Chicago")
+        self.assertEqual(payload["frost_window"]["first_fall_frost"]["median_label"], "Dec 5")
+        mocked_cache.assert_called_once_with(30.2672, -97.7431)
+        mocked_snapshot.assert_not_called()
 
     def test_garden_crop_catalog_is_seeded_into_persistence(self):
         payload = data_persistence.get_garden_crop_catalog()
