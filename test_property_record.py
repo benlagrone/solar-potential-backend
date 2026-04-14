@@ -106,7 +106,7 @@ def build_garden_zones():
 
 def build_property_context():
     return {
-        "context_version": "property-context-v1",
+        "context_version": "property-context-v2",
         "match_envelope": {
             "bounds": {
                 "south": 30.2668,
@@ -155,6 +155,36 @@ def build_property_context():
             },
             "summary": "2 nearby building footprints found.",
         },
+        "canopy_context": {
+            "source": "openstreetmap-overpass",
+            "canopy_count": 3,
+            "nearby_canopy": [
+                {
+                    "id": "osm-node-10",
+                    "name": "Street tree",
+                    "kind": "tree",
+                    "height_m": 10.5,
+                    "distance_m": 14.2,
+                    "direction_bucket": "west",
+                    "direction_group": "west",
+                    "shadow_pressure": 0.66,
+                    "centroid": {"lat": 30.2673, "lng": -97.7435},
+                    "geometry": {"type": "Point", "coordinates": [-97.7435, 30.2673]},
+                }
+            ],
+            "nearest_canopy": {
+                "id": "osm-node-10",
+                "distance_m": 14.2,
+                "direction_bucket": "west",
+            },
+            "directional_pressure": {
+                "north": 0.1,
+                "south": 0.2,
+                "east": 0.0,
+                "west": 0.66,
+            },
+            "summary": "3 nearby tree or canopy features found.",
+        },
         "terrain_context": {
             "source": "opentopodata-srtm90m",
             "center_elevation_m": 160.0,
@@ -168,11 +198,13 @@ def build_property_context():
         },
         "shade_context": {
             "obstruction_risk": "moderate",
+            "building_pressure_score": 1.14,
+            "canopy_pressure_score": 0.66,
             "terrain_bias": "more solar-favored",
-            "summary": "Structure-driven shade risk reads as moderate.",
+            "summary": "Building, vegetation, and terrain cues read as moderate obstruction risk.",
         },
-        "summary": "2 nearby building footprints found. Local terrain reads as rolling with a south-facing bias.",
-        "model_note": "Building and terrain context only.",
+        "summary": "2 nearby building footprints and 3 canopy features found. Local terrain reads as rolling with a south-facing bias.",
+        "model_note": "Buildings, mapped vegetation, and terrain context only.",
     }
 
 
@@ -181,7 +213,7 @@ def build_west_facing_property_context():
     context["terrain_context"]["dominant_aspect"] = "west-facing"
     context["terrain_context"]["summary"] = "Local terrain reads as rolling with a west-facing bias."
     context["shade_context"]["terrain_bias"] = "mostly neutral"
-    context["summary"] = "2 nearby building footprints found. Local terrain reads as rolling with a west-facing bias."
+    context["summary"] = "2 nearby building footprints and 3 canopy features found. Local terrain reads as rolling with a west-facing bias."
     return context
 
 
@@ -378,8 +410,9 @@ class PropertyRecordTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["property_context"]["context_version"], "property-context-v1")
+        self.assertEqual(payload["property_context"]["context_version"], "property-context-v2")
         self.assertEqual(payload["property_context"]["building_context"]["obstruction_risk"], "moderate")
+        self.assertEqual(payload["property_context"]["canopy_context"]["canopy_count"], 3)
 
         record = data_persistence.get_property_record(payload["guid"])
         self.assertEqual(record["property_context"]["terrain_context"]["terrain_class"], "rolling")
@@ -665,7 +698,7 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertLess(payload["monthly_production"]["01"], 1363.7)
         self.assertTrue(
             any(
-                "Nearby building and terrain context contribute about"
+                "Nearby building, vegetation, and terrain context contribute about"
                 in assumption
                 for assumption in payload["assumptions"]
             )
@@ -841,6 +874,8 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertEqual(quote_payload["report"]["id"], saved_report["id"])
         self.assertEqual(quote_payload["quote"]["status"], "share-ready")
         self.assertTrue(quote_payload["quote"]["share_path"].startswith("/quote/"))
+        self.assertTrue(quote_payload["quote"]["lead_capture"]["enabled"])
+        self.assertEqual(quote_payload["quote"]["lead_capture"]["lead_count"], 0)
 
         record = data_persistence.get_property_record(guid)
         stored_quote = record["saved_solar_reports"][0]["homeowner_quote"]
@@ -852,6 +887,75 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertEqual(public_quote_payload["quote"]["id"], stored_quote["id"])
         self.assertEqual(public_quote_payload["report"]["id"], saved_report["id"])
         self.assertEqual(public_quote_payload["address"]["street"], "123 Main St")
+        self.assertEqual(public_quote_payload["quote"]["lead_capture"]["latest_status"], "ready")
+
+    def test_capture_solar_quote_lead_queues_installer_follow_up(self):
+        property_response = self.client.post(
+            "/api/property-record",
+            json={
+                "address": build_address(),
+                "property_preview": build_property_preview(),
+                "roof_selection": build_roof_selection(),
+            },
+        )
+        guid = property_response.json()["guid"]
+
+        with patch.object(main, "get_nrel_api_key", return_value=None):
+            with patch.object(main, "check_existing_zip_data", return_value=(None, None)):
+                with patch.object(main, "geocode_address", return_value=(30.2672, -97.7431)):
+                    with patch.object(main, "get_nasa_power_data", return_value=build_solar_data()):
+                        with patch.object(main, "get_timezone", return_value="America/Chicago"):
+                            report_response = self.client.post(
+                                "/api/solar-report",
+                                json={
+                                    "guid": guid,
+                                    "panel_efficiency": 0.2,
+                                    "electricity_rate": 0.16,
+                                    "installation_cost_per_watt": 3.0,
+                                },
+                            )
+
+        saved_report = report_response.json()["report"]
+        quote_response = self.client.post(
+            "/api/solar-quote",
+            json={
+                "guid": guid,
+                "report_id": saved_report["id"],
+            },
+        )
+        quote_id = quote_response.json()["quote"]["id"]
+
+        lead_response = self.client.post(
+            f"/api/solar-quote/{quote_id}/lead",
+            json={
+                "full_name": "Taylor Homeowner",
+                "email": "taylor@example.com",
+                "phone": "(512) 555-0188",
+                "preferred_contact": "text",
+                "monthly_bill_range": "200-plus",
+                "install_timeline": "1-3-months",
+                "notes": "South roof only, HOA paperwork in progress.",
+                "consent_to_contact": True,
+            },
+        )
+
+        self.assertEqual(lead_response.status_code, 200)
+        lead_payload = lead_response.json()
+        self.assertEqual(lead_payload["lead"]["handoff"]["status"], "queued")
+        self.assertEqual(lead_payload["lead"]["qualification"]["status"], "qualified")
+        self.assertEqual(lead_payload["quote"]["lead_capture"]["lead_count"], 1)
+        self.assertEqual(lead_payload["quote"]["lead_capture"]["latest_status"], "queued")
+        self.assertEqual(
+            lead_payload["report"]["homeowner_quote"]["lead_capture"]["latest_qualification"],
+            "Qualified",
+        )
+
+        public_quote_response = self.client.get(f"/api/solar-quote/{quote_id}")
+        self.assertEqual(public_quote_response.status_code, 200)
+        public_quote_payload = public_quote_response.json()
+        self.assertEqual(public_quote_payload["quote"]["lead_capture"]["lead_count"], 1)
+        self.assertEqual(public_quote_payload["quote"]["lead_capture"]["latest_status"], "queued")
+        self.assertEqual(public_quote_payload["report"]["homeowner_quote"]["lead_capture"]["lead_count"], 1)
 
     def test_property_climate_endpoint_returns_snapshot(self):
         climate_snapshot = build_property_climate()
@@ -935,8 +1039,9 @@ class PropertyRecordTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["context_version"], "property-context-v1")
+        self.assertEqual(payload["context_version"], "property-context-v2")
         self.assertEqual(payload["building_context"]["building_count"], 2)
+        self.assertEqual(payload["canopy_context"]["canopy_count"], 3)
         mocked_snapshot.assert_called_once_with(
             30.2672,
             -97.7431,

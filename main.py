@@ -12,6 +12,7 @@ from data_persistence import (
     check_existing_address_data, check_existing_solar_data, check_existing_zip_data,
     find_property_record_by_address, find_solar_quote, get_property_record, list_property_records,
     upsert_property_record, get_garden_crop_catalog,
+    list_solar_quote_leads, store_solar_quote_lead,
     get_cached_property_climate, store_cached_property_climate,
     build_address_lookup_key, build_coordinate_lookup_key, get_geocode_cache, store_geocode_cache,
 )
@@ -126,6 +127,17 @@ class SolarReportRequest(BaseModel):
 class SolarQuoteRequest(BaseModel):
     guid: str
     report_id: str
+
+
+class SolarQuoteLeadRequest(BaseModel):
+    full_name: str
+    email: str
+    phone: str
+    preferred_contact: str = "phone"
+    monthly_bill_range: Optional[str] = None
+    install_timeline: Optional[str] = None
+    notes: Optional[str] = None
+    consent_to_contact: bool = False
 
 
 class Coordinates(BaseModel):
@@ -1622,7 +1634,7 @@ def build_solar_assumptions(
 
     if production_model.get("site_context_available"):
         assumptions.append(
-            f"Nearby building and terrain context contribute about {production_model.get('modeled_site_losses_percent', 0):.1f}% extra modeled site losses in this planning pass."
+            f"Nearby building, vegetation, and terrain context contribute about {production_model.get('modeled_site_losses_percent', 0):.1f}% extra modeled site losses in this planning pass."
         )
     else:
         assumptions.append(
@@ -1670,7 +1682,7 @@ def build_solar_confidence(
         )
         if production_model.get("site_context_available"):
             score += 5
-            factors.append("Nearby building and terrain context temper the production model for this property.")
+            factors.append("Nearby building, vegetation, and terrain context temper the production model for this property.")
 
     if match_quality == "high":
         score += 18
@@ -1797,6 +1809,134 @@ def build_homeowner_quote(address, report, existing_quote=None):
             "This is a shareable planning quote based on the saved roof geometry and current model assumptions. "
             "Final pricing, layout, and installer scope still require site review."
         ),
+    }
+
+
+def _clean_contact_value(value):
+    return " ".join(str(value or "").strip().split())
+
+
+def _normalized_phone_digits(value):
+    return "".join(character for character in str(value or "") if character.isdigit())
+
+
+def resolve_installer_handoff_route(address):
+    state = str((address or {}).get("state") or "").strip().upper()
+    region_key = normalize_lookup_text(state) or "default"
+    route_label = (
+        f"{state} installer review queue"
+        if state
+        else "Default installer review queue"
+    )
+    partner_name = os.getenv("SOLAR_INSTALLER_HANDOFF_NAME") or "Solar Buddy installer review"
+    partner_email = os.getenv("SOLAR_INSTALLER_HANDOFF_EMAIL") or ""
+
+    return {
+        "route_id": f"{region_key}-installer-review",
+        "route_label": route_label,
+        "region": state or "default",
+        "partner_name": partner_name,
+        "partner_email": partner_email or None,
+        "delivery_channel": "manual-email" if partner_email else "manual-review",
+    }
+
+
+def qualify_solar_lead(monthly_bill_range, install_timeline):
+    strong_bill_ranges = {"200-plus", "100-200"}
+    strong_timelines = {"asap", "1-3-months"}
+
+    if monthly_bill_range in strong_bill_ranges and install_timeline in strong_timelines:
+        return {
+            "status": "qualified",
+            "label": "Qualified",
+            "summary": "The lead includes enough timeline and bill context for installer follow-up.",
+        }
+
+    if install_timeline == "researching":
+        return {
+            "status": "early",
+            "label": "Researching",
+            "summary": "The lead is still early-stage and may need nurture before installer outreach.",
+        }
+
+    return {
+        "status": "review",
+        "label": "Needs review",
+        "summary": "The lead has contact details but still needs manual qualification review.",
+    }
+
+
+def build_quote_lead_capture(address, latest_lead=None, lead_count=0):
+    route = resolve_installer_handoff_route(address)
+    latest_handoff = (latest_lead or {}).get("handoff") or {}
+    latest_qualification = (latest_lead or {}).get("qualification") or {}
+
+    return {
+        "enabled": True,
+        "route": route,
+        "lead_count": int(lead_count or 0),
+        "latest_submitted_at": (latest_lead or {}).get("created_at"),
+        "latest_status": latest_handoff.get("status") or "ready",
+        "latest_qualification": latest_qualification.get("label"),
+        "summary": (
+            latest_handoff.get("summary")
+            or "Lead capture is ready on this homeowner quote for installer follow-up."
+        ),
+    }
+
+
+def hydrate_homeowner_quote(quote, address, latest_lead=None, lead_count=0):
+    if not quote:
+        return None
+
+    return {
+        **quote,
+        "lead_capture": build_quote_lead_capture(
+            address,
+            latest_lead=latest_lead,
+            lead_count=lead_count,
+        ),
+    }
+
+
+def build_solar_quote_lead(quote_id, record, report, payload: SolarQuoteLeadRequest):
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    address = record.get("address") or {}
+    route = resolve_installer_handoff_route(address)
+    qualification = qualify_solar_lead(payload.monthly_bill_range, payload.install_timeline)
+
+    return {
+        "id": str(uuid.uuid4()),
+        "quote_id": quote_id,
+        "property_guid": record.get("guid"),
+        "report_id": report.get("id"),
+        "created_at": timestamp,
+        "contact": {
+            "full_name": _clean_contact_value(payload.full_name),
+            "email": _clean_contact_value(payload.email).lower(),
+            "phone": _clean_contact_value(payload.phone),
+            "preferred_contact": _clean_contact_value(payload.preferred_contact).lower() or "phone",
+        },
+        "address": {
+            "city": address.get("city"),
+            "state": address.get("state"),
+            "zip": address.get("zip"),
+        },
+        "qualification": {
+            **qualification,
+            "monthly_bill_range": payload.monthly_bill_range or "unknown",
+            "install_timeline": payload.install_timeline or "unknown",
+        },
+        "notes": _clean_contact_value(payload.notes),
+        "consent_to_contact": bool(payload.consent_to_contact),
+        "handoff": {
+            **route,
+            "status": "queued",
+            "queued_at": timestamp,
+            "summary": (
+                f"Queued for {route['route_label'].lower()} via {route['delivery_channel']}."
+            ),
+        },
     }
 
 
@@ -2170,7 +2310,7 @@ def reverse_geocode_property(coordinates: Coordinates):
     "/api/property-context",
     response_model=dict,
     summary="Get Property Context",
-    description="Returns first-pass building and terrain context around the property for Solar Buddy and Garden Buddy.",
+    description="Returns first-pass building, vegetation, and terrain context around the property for Solar Buddy and Garden Buddy.",
 )
 def get_property_context(payload: PropertyContextRequest):
     try:
@@ -2349,6 +2489,7 @@ def create_solar_quote(payload: SolarQuoteRequest):
         target_report,
         target_report.get("homeowner_quote"),
     )
+    hydrated_quote = hydrate_homeowner_quote(quote, property_record["address"])
     next_reports = []
     updated_report = None
     for report in reports:
@@ -2372,9 +2513,71 @@ def create_solar_quote(payload: SolarQuoteRequest):
     )
 
     return {
-        "quote": quote,
-        "report": updated_report,
-        "reports": next_reports,
+        "quote": hydrated_quote,
+        "report": {
+            **(updated_report or {}),
+            "homeowner_quote": hydrated_quote,
+        }
+        if updated_report
+        else None,
+        "reports": [
+            {
+                **report,
+                "homeowner_quote": (
+                    hydrated_quote
+                    if report.get("id") == payload.report_id and report.get("homeowner_quote")
+                    else report.get("homeowner_quote")
+                ),
+            }
+            if report.get("homeowner_quote")
+            else report
+            for report in next_reports
+        ],
+    }
+
+
+@app.post(
+    "/api/solar-quote/{quote_id}/lead",
+    response_model=dict,
+    summary="Capture Solar Quote Lead",
+    description="Captures a qualified homeowner lead from a shareable quote and queues it for installer follow-up.",
+)
+def capture_solar_quote_lead(quote_id: str, payload: SolarQuoteLeadRequest):
+    match = find_solar_quote(quote_id)
+    if not match:
+        raise HTTPException(status_code=404, detail="Solar quote not found")
+
+    full_name = _clean_contact_value(payload.full_name)
+    email = _clean_contact_value(payload.email).lower()
+    phone = _clean_contact_value(payload.phone)
+    if not full_name:
+        raise HTTPException(status_code=400, detail="Full name is required")
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid email is required")
+    if len(_normalized_phone_digits(phone)) < 10:
+        raise HTTPException(status_code=400, detail="A valid phone number is required")
+    if not payload.consent_to_contact:
+        raise HTTPException(status_code=400, detail="Consent to contact is required")
+
+    record = match["record"]
+    report = match["report"]
+    lead = build_solar_quote_lead(quote_id, record, report, payload)
+    store_solar_quote_lead(lead)
+    leads = list_solar_quote_leads(quote_id)
+    hydrated_quote = hydrate_homeowner_quote(
+        match["quote"],
+        record.get("address"),
+        latest_lead=leads[0] if leads else lead,
+        lead_count=len(leads),
+    )
+
+    return {
+        "lead": lead,
+        "quote": hydrated_quote,
+        "report": {
+            **report,
+            "homeowner_quote": hydrated_quote,
+        },
     }
 
 
@@ -2390,9 +2593,23 @@ def get_solar_quote(quote_id: str):
         raise HTTPException(status_code=404, detail="Solar quote not found")
 
     record = match["record"]
+    leads = list_solar_quote_leads(quote_id)
     return {
-        "quote": match["quote"],
-        "report": match["report"],
+        "quote": hydrate_homeowner_quote(
+            match["quote"],
+            record.get("address"),
+            latest_lead=leads[0] if leads else None,
+            lead_count=len(leads),
+        ),
+        "report": {
+            **match["report"],
+            "homeowner_quote": hydrate_homeowner_quote(
+                match["quote"],
+                record.get("address"),
+                latest_lead=leads[0] if leads else None,
+                lead_count=len(leads),
+            ),
+        },
         "address": record.get("address"),
         "property_preview": record.get("property_preview"),
     }

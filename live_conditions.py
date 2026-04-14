@@ -20,6 +20,9 @@ NOAA_ALERTS_URL = "https://services.swpc.noaa.gov/products/alerts.json"
 NOAA_PLASMA_URL = "https://services.swpc.noaa.gov/products/solar-wind/plasma-2-hour.json"
 NOAA_XRAY_URL = "https://services.swpc.noaa.gov/json/goes/primary/xrays-1-day.json"
 NOAA_AURORA_OVATION_URL = "https://services.swpc.noaa.gov/json/ovation_aurora_latest.json"
+NOAA_DRAP_URL = "https://services.swpc.noaa.gov/text/drap_global_frequencies.txt"
+NOAA_GLOTEC_INDEX_URL = "https://services.swpc.noaa.gov/products/glotec/geojson_2d_urt.json"
+NOAA_BASE_URL = "https://services.swpc.noaa.gov"
 NASA_DONKI_FLR_URL = "https://kauai.ccmc.gsfc.nasa.gov/DONKI/WS/get/FLR"
 NASA_DONKI_GST_URL = "https://kauai.ccmc.gsfc.nasa.gov/DONKI/WS/get/GST"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
@@ -186,6 +189,37 @@ def _fetch_optional_json(
         }
 
 
+def _fetch_optional_text(
+    url: str,
+    params: Optional[dict[str, Any]] = None,
+    ttl_seconds: int = 300,
+    *,
+    force_refresh: bool = False,
+    source_name: Optional[str] = None,
+    default_data: str = "",
+):
+    normalized_source = source_name or url
+    try:
+        return _fetch_text(
+            url,
+            params=params,
+            ttl_seconds=ttl_seconds,
+            force_refresh=force_refresh,
+            return_metadata=True,
+            source_name=normalized_source,
+        )
+    except requests.RequestException as exc:
+        logger.warning("Optional upstream text fetch failed for %s: %s", normalized_source, str(exc))
+        return {
+            "data": default_data,
+            "freshness": _build_unavailable_source_freshness(
+                normalized_source,
+                ttl_seconds=ttl_seconds,
+                detail=str(exc),
+            ),
+        }
+
+
 def _fetch_json(
     url: str,
     params: Optional[dict[str, Any]] = None,
@@ -236,6 +270,69 @@ def _fetch_json(
     except (requests.RequestException, json.JSONDecodeError):
         if cached:
             logger.warning("Using cached fallback for %s after upstream fetch failure", normalized_source, exc_info=True)
+            result = {
+                "data": cached["data"],
+                "freshness": _build_source_freshness(
+                    cached,
+                    now,
+                    source=normalized_source,
+                    cache_hit=True,
+                    refresh_failed=True,
+                ),
+            }
+            return result if return_metadata else result["data"]
+        raise
+
+
+def _fetch_text(
+    url: str,
+    params: Optional[dict[str, Any]] = None,
+    ttl_seconds: int = 300,
+    *,
+    force_refresh: bool = False,
+    return_metadata: bool = False,
+    source_name: Optional[str] = None,
+):
+    key = (url, _normalize_params(params))
+    now = time.time()
+    cached = _CACHE.get(key)
+    normalized_source = source_name or url
+    if cached and cached["expires_at"] > now and not force_refresh:
+        result = {
+            "data": cached["data"],
+            "freshness": _build_source_freshness(
+                cached,
+                now,
+                source=normalized_source,
+                cache_hit=True,
+            ),
+        }
+        return result if return_metadata else result["data"]
+
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        fetched_at = time.time()
+        cache_entry = {
+            "data": response.text,
+            "fetched_at": fetched_at,
+            "expires_at": fetched_at + ttl_seconds,
+            "ttl_seconds": ttl_seconds,
+        }
+        _CACHE[key] = cache_entry
+        result = {
+            "data": response.text,
+            "freshness": _build_source_freshness(
+                cache_entry,
+                fetched_at,
+                source=normalized_source,
+                cache_hit=False,
+            ),
+        }
+        return result if return_metadata else result["data"]
+    except requests.RequestException:
+        if cached:
+            logger.warning("Using cached text fallback for %s after upstream fetch failure", normalized_source, exc_info=True)
             result = {
                 "data": cached["data"],
                 "freshness": _build_source_freshness(
@@ -392,6 +489,245 @@ def _haversine_km(latitude_a: float, longitude_a: float, latitude_b: float, long
         * math.sin(delta_longitude / 2.0) ** 2
     )
     return 2.0 * radius_km * math.asin(math.sqrt(max(0.0, min(1.0, haversine))))
+
+
+def _build_drap_context(text_payload: str, latitude: float, longitude: float):
+    default_context = {
+        "source": "noaa-drap",
+        "status": "unavailable",
+        "observed_at": None,
+        "recovery_time": None,
+        "xray_message": None,
+        "proton_message": None,
+        "absorption_frequency_mhz": None,
+        "risk": "low",
+        "detail": "D-RAP absorption detail is unavailable right now.",
+    }
+    if not text_payload:
+        return default_context
+
+    lines = [line.rstrip() for line in str(text_payload).splitlines() if line.strip()]
+    longitude_line = ""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "|" in stripped:
+            continue
+
+        tokens = stripped.split()
+        try:
+            [float(token) for token in tokens]
+        except ValueError:
+            continue
+
+        if len(tokens) >= 5:
+            longitude_line = stripped
+            break
+
+    if not longitude_line:
+        return default_context
+
+    try:
+        longitude_values = [float(token) for token in longitude_line.split()]
+    except ValueError:
+        return default_context
+
+    latitude_rows = []
+    for line in lines:
+        if "|" not in line:
+            continue
+        latitude_part, values_part = line.split("|", 1)
+        try:
+            row_latitude = float(latitude_part.strip())
+            row_values = [float(token) for token in values_part.split()]
+        except ValueError:
+            continue
+        if len(row_values) != len(longitude_values):
+            continue
+        latitude_rows.append((row_latitude, row_values))
+
+    if not latitude_rows:
+        return default_context
+
+    nearest_latitude, nearest_row = min(
+        latitude_rows,
+        key=lambda row: abs(row[0] - latitude),
+    )
+    normalized_longitude = _normalize_longitude(longitude)
+    nearest_index = min(
+        range(len(longitude_values)),
+        key=lambda index: _longitude_distance_degrees(longitude_values[index], normalized_longitude),
+    )
+    nearest_longitude = longitude_values[nearest_index]
+    absorption_frequency = max(float(nearest_row[nearest_index]), 0.0)
+
+    if absorption_frequency >= 12:
+        risk = "high"
+    elif absorption_frequency >= 6:
+        risk = "moderate"
+    elif absorption_frequency > 0:
+        risk = "low"
+    else:
+        risk = "low"
+
+    metadata = {}
+    for line in lines:
+        if not line.startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+        label, value = line[1:].split(":", 1)
+        metadata[label.strip().lower()] = value.strip()
+
+    detail = (
+        "D-RAP does not show meaningful HF absorption at this grid point right now."
+        if absorption_frequency <= 0
+        else (
+            f"D-RAP suggests HF absorption effects up through about {absorption_frequency:.1f} MHz "
+            f"near {nearest_latitude:.0f}° latitude and {nearest_longitude:.0f}° longitude."
+        )
+    )
+
+    return {
+        "source": "noaa-drap",
+        "status": "available",
+        "observed_at": metadata.get("product valid at"),
+        "recovery_time": metadata.get("estimated recovery time"),
+        "xray_message": metadata.get("x-ray message"),
+        "xray_warning": metadata.get("x-ray warning"),
+        "proton_message": metadata.get("proton message"),
+        "proton_warning": metadata.get("proton warning"),
+        "absorption_frequency_mhz": round(absorption_frequency, 1),
+        "risk": risk,
+        "nearest_grid_point": {
+            "latitude": nearest_latitude,
+            "longitude": nearest_longitude,
+        },
+        "detail": detail,
+    }
+
+
+def _fetch_glotec_context(latitude: float, longitude: float, force_refresh: bool = False):
+    index_response = _fetch_optional_json(
+        NOAA_GLOTEC_INDEX_URL,
+        ttl_seconds=300,
+        force_refresh=force_refresh,
+        source_name="noaa-glotec-index",
+        default_data=[],
+    )
+    index_payload = index_response.get("data") or []
+    if not isinstance(index_payload, list) or not index_payload:
+        return {
+            "source": "noaa-glotec",
+            "status": "unavailable",
+            "detail": "GloTEC grid detail is unavailable right now.",
+            "freshness": _aggregate_freshness(
+                {"noaa-glotec-index": index_response.get("freshness") or {}}
+            ),
+        }
+
+    latest_entry = index_payload[-1] or {}
+    relative_url = str(latest_entry.get("url") or "").strip()
+    if not relative_url:
+        return {
+            "source": "noaa-glotec",
+            "status": "unavailable",
+            "detail": "GloTEC index did not provide a latest grid URL.",
+            "freshness": _aggregate_freshness(
+                {"noaa-glotec-index": index_response.get("freshness") or {}}
+            ),
+        }
+
+    file_url = f"{NOAA_BASE_URL}{relative_url}" if relative_url.startswith("/") else relative_url
+    grid_response = _fetch_optional_json(
+        file_url,
+        ttl_seconds=300,
+        force_refresh=force_refresh,
+        source_name="noaa-glotec-grid",
+        default_data={},
+    )
+    grid_payload = grid_response.get("data") or {}
+    features = grid_payload.get("features") or []
+
+    if not isinstance(features, list) or not features:
+        return {
+            "source": "noaa-glotec",
+            "status": "unavailable",
+            "detail": "GloTEC grid content is unavailable right now.",
+            "freshness": _aggregate_freshness(
+                {
+                    "noaa-glotec-index": index_response.get("freshness") or {},
+                    "noaa-glotec-grid": grid_response.get("freshness") or {},
+                }
+            ),
+        }
+
+    nearest_feature = None
+    nearest_distance = None
+    for feature in features:
+        coordinates = ((feature.get("geometry") or {}).get("coordinates") or [])
+        if len(coordinates) < 2:
+            continue
+        feature_longitude = _safe_float(coordinates[0], None)
+        feature_latitude = _safe_float(coordinates[1], None)
+        if feature_latitude is None or feature_longitude is None:
+            continue
+        distance_km = _haversine_km(latitude, longitude, feature_latitude, feature_longitude)
+        if nearest_distance is None or distance_km < nearest_distance:
+            nearest_distance = distance_km
+            nearest_feature = feature
+
+    if not nearest_feature:
+        return {
+            "source": "noaa-glotec",
+            "status": "unavailable",
+            "detail": "GloTEC did not return a usable local grid point.",
+            "freshness": _aggregate_freshness(
+                {
+                    "noaa-glotec-index": index_response.get("freshness") or {},
+                    "noaa-glotec-grid": grid_response.get("freshness") or {},
+                }
+            ),
+        }
+
+    properties = nearest_feature.get("properties") or {}
+    anomaly = _optional_float(properties.get("anomaly"))
+    tec = _optional_float(properties.get("tec"))
+    quality_flag = int(_safe_float(properties.get("quality_flag"), 0))
+
+    anomaly_magnitude = abs(anomaly or 0.0)
+    if quality_flag > 0 or anomaly_magnitude >= 10:
+        risk = "high"
+    elif anomaly_magnitude >= 4:
+        risk = "moderate"
+    else:
+        risk = "low"
+
+    return {
+        "source": "noaa-glotec",
+        "status": "available",
+        "observed_at": latest_entry.get("time_tag"),
+        "tec": _round_float(tec, 2),
+        "anomaly": _round_float(anomaly, 2),
+        "hmf2_km": _round_float(_optional_float(properties.get("hmF2")), 1),
+        "nmf2_per_m3": _round_float(_optional_float(properties.get("NmF2")), 0),
+        "quality_flag": quality_flag,
+        "risk": risk,
+        "distance_km": _round_float(nearest_distance, 0),
+        "detail": (
+            "GloTEC is quiet near this property right now."
+            if anomaly_magnitude < 2 and quality_flag == 0
+            else (
+                f"GloTEC shows a local ionospheric anomaly of about {anomaly_magnitude:.1f} TEC units "
+                f"near this property."
+            )
+        ),
+        "freshness": _aggregate_freshness(
+            {
+                "noaa-glotec-index": index_response.get("freshness") or {},
+                "noaa-glotec-grid": grid_response.get("freshness") or {},
+            }
+        ),
+    }
 
 
 def _build_aurora_context(
@@ -575,7 +911,16 @@ def _aurora_potential(
     return "low"
 
 
-def _hf_radio_risk(radio_blackout_scale: int, is_daylight: bool) -> str:
+def _hf_radio_risk(
+    radio_blackout_scale: int,
+    is_daylight: bool,
+    drap_context: Optional[dict[str, Any]] = None,
+) -> str:
+    drap_risk = str((drap_context or {}).get("risk") or "low")
+    if drap_risk == "high":
+        return "high"
+    if drap_risk == "moderate":
+        return "moderate"
     if not is_daylight or radio_blackout_scale <= 0:
         return "low"
     if radio_blackout_scale >= 3:
@@ -585,7 +930,17 @@ def _hf_radio_risk(radio_blackout_scale: int, is_daylight: bool) -> str:
     return "low"
 
 
-def _gnss_risk(geomagnetic_scale: int, radiation_scale: int, latitude: float) -> str:
+def _gnss_risk(
+    geomagnetic_scale: int,
+    radiation_scale: int,
+    latitude: float,
+    glotec_context: Optional[dict[str, Any]] = None,
+) -> str:
+    glotec_risk = str((glotec_context or {}).get("risk") or "low")
+    if glotec_risk == "high":
+        return "high"
+    if glotec_risk == "moderate":
+        return "moderate"
     absolute_latitude = abs(latitude)
     if geomagnetic_scale >= 3:
         return "high"
@@ -605,19 +960,31 @@ def _space_weather_alert_level(
     warning_count: int,
     watch_count: int,
     aurora_context: Optional[dict[str, Any]] = None,
+    drap_context: Optional[dict[str, Any]] = None,
+    glotec_context: Optional[dict[str, Any]] = None,
 ) -> str:
     absolute_latitude = abs(latitude)
     aurora_reach = str((aurora_context or {}).get("reach") or "")
+    drap_risk = str((drap_context or {}).get("risk") or "low")
+    glotec_risk = str((glotec_context or {}).get("risk") or "low")
 
     if radio_blackout_scale >= 2 and is_daylight:
+        return "alert"
+    if drap_risk == "high" and is_daylight:
         return "alert"
     if not is_daylight and geomagnetic_scale >= 3 and aurora_reach in {"overhead", "within-viewline"}:
         return "alert"
     if geomagnetic_scale >= 3 and absolute_latitude >= 45:
         return "alert"
+    if glotec_risk == "high":
+        return "alert"
     if radiation_scale >= 2 and absolute_latitude >= 55:
         return "alert"
     if warning_count > 0:
+        return "watch"
+    if drap_risk == "moderate" and is_daylight:
+        return "watch"
+    if glotec_risk == "moderate":
         return "watch"
     if not is_daylight and geomagnetic_scale >= 2 and aurora_reach in {"overhead", "within-viewline", "nearby-viewline"}:
         return "watch"
@@ -635,18 +1002,34 @@ def _build_space_weather_summary(
     aurora_potential: str,
     gnss_risk: str,
     aurora_context: Optional[dict[str, Any]] = None,
+    drap_context: Optional[dict[str, Any]] = None,
+    glotec_context: Optional[dict[str, Any]] = None,
 ) -> str:
     aurora_reach = str((aurora_context or {}).get("reach") or "")
+    drap_risk = str((drap_context or {}).get("risk") or "low")
+    glotec_risk = str((glotec_context or {}).get("risk") or "low")
     if alert_level == "alert" and radio_blackout_scale >= 2 and is_daylight:
         return (
             "A flare-driven radio blackout signal is active for the sunlit side of Earth. "
             "Communication effects matter more here than any residential ground-level radiation concern."
         )
 
+    if alert_level == "alert" and drap_risk == "high" and is_daylight:
+        return (
+            "HF absorption is elevated for this daylight-side location right now. "
+            "Shortwave communication effects are more locally relevant than any residential radiation concern."
+        )
+
     if alert_level == "alert" and aurora_reach in {"overhead", "within-viewline"} and not is_daylight:
         return (
             "Geomagnetic conditions are elevated enough that NOAA's aurora footprint reaches this property's "
             "latitude band tonight. Aurora visibility and GNSS instability are more locally relevant than usual."
+        )
+
+    if alert_level == "alert" and glotec_risk == "high":
+        return (
+            "Ionospheric conditions are elevated enough to matter locally. "
+            "GNSS timing and positioning may be less stable than usual at this property."
         )
 
     if alert_level == "alert" and geomagnetic_scale >= 3:
@@ -669,6 +1052,18 @@ def _build_space_weather_summary(
             summary += " Minor GNSS instability is possible."
         return summary
 
+    if alert_level == "watch" and drap_risk == "moderate" and is_daylight:
+        return (
+            "D-RAP shows some daylight-side HF absorption near this property. "
+            "Radio effects are more relevant than any direct residential ground-level concern."
+        )
+
+    if alert_level == "watch" and glotec_risk == "moderate":
+        return (
+            "Ionospheric conditions are mildly elevated near this property. "
+            "Minor GNSS or timing instability is possible."
+        )
+
     if radiation_scale >= 1:
         return (
             "Solar activity is elevated, but the strongest radiation-storm effects remain more "
@@ -686,6 +1081,8 @@ def _build_space_weather_reasons(
     latitude_band: str,
     aurora_potential: str,
     aurora_context: Optional[dict[str, Any]],
+    drap_context: Optional[dict[str, Any]],
+    glotec_context: Optional[dict[str, Any]],
     hf_radio_risk: str,
     gnss_risk: str,
     ground_note: str,
@@ -711,7 +1108,11 @@ def _build_space_weather_reasons(
         )
     )
     gnss_detail = (
-        "Navigation and timing systems are the main local risk path from current geomagnetic conditions."
+        (
+            f"{glotec_context.get('detail')} Navigation and timing systems are the main local risk path from current ionospheric conditions."
+            if glotec_context and glotec_context.get("status") == "available" and glotec_context.get("risk") in {"moderate", "high"}
+            else "Navigation and timing systems are the main local risk path from current geomagnetic conditions."
+        )
         if gnss_risk in {"moderate", "high"}
         else "Current geomagnetic conditions are not signaling meaningful local GNSS disruption."
     )
@@ -748,7 +1149,11 @@ def _build_space_weather_reasons(
             "label": f"HF radio {hf_radio_risk}",
             "tone": hf_radio_risk,
             "detail": (
-                "HF radio disruption risk is elevated locally because radio-blackout conditions are active on the daylight side."
+                (
+                    drap_context.get("detail")
+                    if drap_context and drap_context.get("status") == "available" and drap_context.get("absorption_frequency_mhz") not in (None, 0)
+                    else "HF radio disruption risk is elevated locally because radio-blackout conditions are active on the daylight side."
+                )
                 if hf_radio_risk in {"moderate", "high"}
                 else "HF radio disruption risk is currently low at this location."
             ),
@@ -758,6 +1163,42 @@ def _build_space_weather_reasons(
             "label": f"GNSS {gnss_risk}",
             "tone": gnss_risk,
             "detail": gnss_detail,
+        },
+        {
+            "id": "drap",
+            "label": (
+                f"D-RAP {drap_context.get('risk')}"
+                if drap_context and drap_context.get("status") == "available"
+                else "D-RAP unavailable"
+            ),
+            "tone": (
+                drap_context.get("risk")
+                if drap_context and drap_context.get("status") == "available"
+                else "neutral"
+            ),
+            "detail": (
+                drap_context.get("detail")
+                if drap_context and drap_context.get("detail")
+                else "D-RAP detail is unavailable in this response."
+            ),
+        },
+        {
+            "id": "glotec",
+            "label": (
+                f"GloTEC {glotec_context.get('risk')}"
+                if glotec_context and glotec_context.get("status") == "available"
+                else "GloTEC unavailable"
+            ),
+            "tone": (
+                glotec_context.get("risk")
+                if glotec_context and glotec_context.get("status") == "available"
+                else "neutral"
+            ),
+            "detail": (
+                glotec_context.get("detail")
+                if glotec_context and glotec_context.get("detail")
+                else "GloTEC detail is unavailable in this response."
+            ),
         },
         {
             "id": "ground-radiation",
@@ -1513,11 +1954,24 @@ def get_space_weather_snapshot(
         source_name="noaa-ovation-aurora",
         default_data={},
     )
+    drap_response = _fetch_optional_text(
+        NOAA_DRAP_URL,
+        ttl_seconds=60,
+        force_refresh=force_refresh,
+        source_name="noaa-drap",
+        default_data="",
+    )
     scales_payload = scales_response["data"]
     alerts_payload = alerts_response["data"]
     plasma_payload = plasma_response["data"]
     xray_payload = xray_response["data"]
     aurora_payload = aurora_response["data"]
+    drap_context = _build_drap_context(drap_response.get("data") or "", latitude, longitude)
+    glotec_context = _fetch_glotec_context(
+        latitude,
+        longitude,
+        force_refresh=force_refresh,
+    )
 
     end_date = datetime.now(timezone.utc).date()
     start_date = end_date - timedelta(days=7)
@@ -1613,11 +2067,16 @@ def get_space_weather_snapshot(
         is_daylight,
         aurora_context,
     )
-    hf_radio_risk = _hf_radio_risk(radio_blackout_scale["scale"], is_daylight)
+    hf_radio_risk = _hf_radio_risk(
+        radio_blackout_scale["scale"],
+        is_daylight,
+        drap_context,
+    )
     gnss_risk = _gnss_risk(
         geomagnetic_storm_scale["scale"],
         radiation_storm_scale["scale"],
         latitude,
+        glotec_context,
     )
     ground_note = (
         "No elevated residential ground-level concern."
@@ -1633,6 +2092,8 @@ def get_space_weather_snapshot(
         warning_count,
         watch_count,
         aurora_context,
+        drap_context,
+        glotec_context,
     )
 
     summary = _build_space_weather_summary(
@@ -1644,6 +2105,8 @@ def get_space_weather_snapshot(
         aurora_potential,
         gnss_risk,
         aurora_context,
+        drap_context,
+        glotec_context,
     )
     freshness_sources = {
         "noaa-scales": scales_response.get("freshness") or {},
@@ -1651,9 +2114,11 @@ def get_space_weather_snapshot(
         "noaa-solar-wind": plasma_response.get("freshness") or {},
         "noaa-goes-xray": xray_response.get("freshness") or {},
         "noaa-ovation-aurora": aurora_response.get("freshness") or {},
+        "noaa-drap": drap_response.get("freshness") or {},
         "nasa-donki-flares": flares_response.get("freshness") or {},
         "nasa-donki-geomagnetic-storms": storms_response.get("freshness") or {},
     }
+    freshness_sources.update((glotec_context.get("freshness") or {}).get("sources") or {})
     freshness_sources.update((irradiance_snapshot.get("freshness") or {}).get("sources") or {})
     reasons = _build_space_weather_reasons(
         radio_blackout_scale["scale"],
@@ -1663,6 +2128,8 @@ def get_space_weather_snapshot(
         latitude_band,
         aurora_potential,
         aurora_context,
+        drap_context,
+        glotec_context,
         hf_radio_risk,
         gnss_risk,
         ground_note,
@@ -1706,6 +2173,12 @@ def get_space_weather_snapshot(
             "latitude_band": latitude_band,
             "aurora_visibility_potential": aurora_potential,
             "aurora_viewline": aurora_context,
+            "drap": drap_context,
+            "glotec": {
+                key: value
+                for key, value in glotec_context.items()
+                if key != "freshness"
+            },
             "hf_radio_risk": hf_radio_risk,
             "gnss_risk": gnss_risk,
             "ground_radiation_note": ground_note,
@@ -1728,6 +2201,8 @@ def get_space_weather_snapshot(
             "noaa-solar-wind",
             "noaa-goes-xray",
             "noaa-ovation-aurora",
+            "noaa-drap",
+            "noaa-glotec",
             "nasa-donki",
             "open-meteo-forecast",
         ],

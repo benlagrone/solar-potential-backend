@@ -15,6 +15,7 @@ _property_record_memory = {}
 _geocode_cache_memory = {}
 _garden_crop_catalog_memory = {}
 _property_climate_snapshot_memory = {}
+_solar_quote_lead_memory = {}
 _UNSET = object()
 _RECENT_CACHE_DAYS = 30
 
@@ -141,6 +142,18 @@ def _initialize_db(connection):
             climate_json TEXT NOT NULL,
             stored_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS solar_quote_leads (
+            lead_id TEXT PRIMARY KEY,
+            quote_id TEXT NOT NULL,
+            property_guid TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            lead_json TEXT NOT NULL,
+            stored_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_solar_quote_leads_quote_id
+            ON solar_quote_leads(quote_id, stored_at);
         """
     )
     columns = {
@@ -205,6 +218,25 @@ def _remember_garden_crop_catalog(payload):
     _garden_crop_catalog_memory[catalog_id] = payload
 
 
+def _remember_solar_quote_lead(payload):
+    quote_id = payload.get("quote_id")
+    lead_id = payload.get("id")
+    if not quote_id or not lead_id:
+        return
+
+    existing = [
+        lead
+        for lead in _solar_quote_lead_memory.get(quote_id, [])
+        if lead.get("id") != lead_id
+    ]
+    existing.append(payload)
+    existing.sort(
+        key=lambda lead: str(lead.get("created_at") or lead.get("stored_at") or ""),
+        reverse=True,
+    )
+    _solar_quote_lead_memory[quote_id] = existing
+
+
 def _write_garden_crop_catalog(connection, payload):
     stored_at = payload.get("stored_at") or _reference_data_stored_at_value()
     normalized_payload = {
@@ -233,6 +265,42 @@ def _write_garden_crop_catalog(connection, payload):
         ),
     )
     _remember_garden_crop_catalog(normalized_payload)
+
+
+def _write_solar_quote_lead(connection, payload):
+    stored_at = payload.get("stored_at") or _reference_data_stored_at_value()
+    normalized_payload = {
+        **payload,
+        "stored_at": stored_at,
+    }
+    connection.execute(
+        """
+        INSERT INTO solar_quote_leads (
+            lead_id,
+            quote_id,
+            property_guid,
+            report_id,
+            lead_json,
+            stored_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(lead_id) DO UPDATE SET
+            quote_id = excluded.quote_id,
+            property_guid = excluded.property_guid,
+            report_id = excluded.report_id,
+            lead_json = excluded.lead_json,
+            stored_at = excluded.stored_at
+        """,
+        (
+            normalized_payload["id"],
+            normalized_payload["quote_id"],
+            normalized_payload["property_guid"],
+            normalized_payload["report_id"],
+            json.dumps(normalized_payload),
+            stored_at,
+        ),
+    )
+    _remember_solar_quote_lead(normalized_payload)
 
 
 def _seed_garden_crop_catalog(connection):
@@ -326,6 +394,7 @@ def reset_memory_storage():
     _geocode_cache_memory.clear()
     _garden_crop_catalog_memory.clear()
     _property_climate_snapshot_memory.clear()
+    _solar_quote_lead_memory.clear()
 
     try:
         with _connect() as connection:
@@ -335,6 +404,7 @@ def reset_memory_storage():
             connection.execute("DELETE FROM property_records")
             connection.execute("DELETE FROM garden_crop_catalogs")
             connection.execute("DELETE FROM property_climate_snapshots")
+            connection.execute("DELETE FROM solar_quote_leads")
             connection.commit()
     except sqlite3.Error as exc:
         logger.warning("Unable to reset SQLite persistence: %s", str(exc))
@@ -447,6 +517,48 @@ def get_garden_crop_catalog(catalog_id="default"):
         return seed_payload
 
     return None
+
+
+def list_solar_quote_leads(quote_id):
+    if not quote_id:
+        return []
+
+    try:
+        with _connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT lead_json
+                FROM solar_quote_leads
+                WHERE quote_id = ?
+                ORDER BY stored_at DESC
+                """,
+                (quote_id,),
+            ).fetchall()
+        payloads = [_json_load(row["lead_json"], default={}) or {} for row in rows]
+        payloads = [payload for payload in payloads if payload]
+        if payloads:
+            for payload in payloads:
+                _remember_solar_quote_lead(payload)
+            return payloads
+    except sqlite3.Error as exc:
+        logger.warning("Quote lead lookup fell back to memory: %s", str(exc))
+
+    return list(_solar_quote_lead_memory.get(quote_id, []))
+
+
+def store_solar_quote_lead(payload):
+    if not payload or not payload.get("id") or not payload.get("quote_id"):
+        return
+
+    try:
+        with _connect() as connection:
+            _write_solar_quote_lead(connection, payload)
+            connection.commit()
+        return
+    except sqlite3.Error as exc:
+        logger.warning("Quote lead persistence fell back to memory: %s", str(exc))
+
+    _remember_solar_quote_lead(payload)
 
 
 def find_solar_quote(quote_id):

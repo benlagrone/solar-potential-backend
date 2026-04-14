@@ -173,6 +173,15 @@ def _build_polygon_geometry(points: list[dict[str, float]]):
     }
 
 
+def _build_point_geometry(point: Optional[dict[str, float]]):
+    if not point:
+        return None
+    return {
+        "type": "Point",
+        "coordinates": [round(point["lng"], 6), round(point["lat"], 6)],
+    }
+
+
 def _classify_pressure(score: float):
     if score >= 0.7:
         return "high"
@@ -189,6 +198,34 @@ def _classify_terrain(slope_percent: float):
     if slope_percent >= 3:
         return "gentle"
     return "flat"
+
+
+def _parse_canopy_height_meters(tags: dict[str, Any]):
+    height_value = str(tags.get("height") or tags.get("est_height") or "").strip().lower()
+    if height_value:
+        feet_match = re.search(r"(-?\d+(?:\.\d+)?)\s*ft", height_value)
+        if feet_match:
+            return max(float(feet_match.group(1)) * 0.3048, 2.5)
+
+        number_match = re.search(r"(-?\d+(?:\.\d+)?)", height_value)
+        if number_match:
+            return max(float(number_match.group(1)), 2.5)
+
+    genus = str(tags.get("genus") or "").lower()
+    natural = str(tags.get("natural") or "").lower()
+    landuse = str(tags.get("landuse") or "").lower()
+
+    if natural == "tree":
+        return 8.0 if genus not in {"palm"} else 5.0
+    if natural in {"wood", "tree_row"}:
+        return 7.0
+    if natural == "scrub":
+        return 3.5
+    if landuse in {"forest", "orchard"}:
+        return 6.5
+    if landuse == "vineyard":
+        return 2.5
+    return 5.5
 
 
 def _build_context_envelope(latitude: float, longitude: float, bounds: Optional[dict[str, Any]]):
@@ -243,6 +280,21 @@ def _build_overpass_buildings(latitude: float, longitude: float, radius_m: int):
         f'[out:json][timeout:20];'
         f'way["building"](around:{radius_m},{latitude},{longitude});'
         f'out tags geom center;'
+    )
+
+
+def _build_overpass_canopy(latitude: float, longitude: float, radius_m: int):
+    query = (
+        f'[out:json][timeout:20];('
+        f'node["natural"="tree"](around:{radius_m},{latitude},{longitude});'
+        f'way["natural"~"wood|tree_row|scrub"](around:{radius_m},{latitude},{longitude});'
+        f'way["landuse"~"forest|orchard|vineyard"](around:{radius_m},{latitude},{longitude});'
+        f');out tags geom center;'
+    )
+    return _fetch_json(
+        OVERPASS_INTERPRETER_URL,
+        params={"data": query},
+        ttl_seconds=86400,
     )
     return _fetch_json(
         OVERPASS_INTERPRETER_URL,
@@ -348,6 +400,129 @@ def _build_building_context(latitude: float, longitude: float, envelope: dict[st
     }
 
 
+def _build_canopy_context(latitude: float, longitude: float, envelope: dict[str, Any]):
+    radius_m = int(_clamp(max(envelope.get("width_m") or 0, envelope.get("height_m") or 0) * 1.05, 35, 85))
+    try:
+        payload = _build_overpass_canopy(latitude, longitude, radius_m)
+    except requests.RequestException:
+        return {
+            "source": "openstreetmap-overpass",
+            "search_radius_m": radius_m,
+            "canopy_count": 0,
+            "nearby_canopy": [],
+            "nearest_canopy": None,
+            "directional_pressure": {
+                "north": 0.0,
+                "south": 0.0,
+                "east": 0.0,
+                "west": 0.0,
+            },
+            "summary": "Mapped canopy context is unavailable for this property right now.",
+        }
+
+    directional_scores = {"north": 0.0, "south": 0.0, "east": 0.0, "west": 0.0}
+    nearby_canopy = []
+
+    for element in payload.get("elements") or []:
+        tags = element.get("tags") or {}
+        centroid = None
+        geometry = None
+
+        if element.get("type") == "node":
+            if element.get("lat") is None or element.get("lon") is None:
+                continue
+            centroid = {
+                "lat": round(float(element.get("lat")), 6),
+                "lng": round(float(element.get("lon")), 6),
+            }
+            geometry = _build_point_geometry(centroid)
+        else:
+            geometry_points = [
+                {
+                    "lat": float(point.get("lat")),
+                    "lng": float(point.get("lon")),
+                }
+                for point in (element.get("geometry") or [])
+                if point.get("lat") is not None and point.get("lon") is not None
+            ]
+            centroid = (
+                {
+                    "lat": round(float((element.get("center") or {}).get("lat")), 6),
+                    "lng": round(float((element.get("center") or {}).get("lon")), 6),
+                }
+                if (element.get("center") or {}).get("lat") is not None
+                and (element.get("center") or {}).get("lon") is not None
+                else _polygon_centroid(geometry_points)
+            )
+            geometry = _build_polygon_geometry(geometry_points) if len(geometry_points) >= 3 else None
+
+        if not centroid:
+            continue
+
+        distance_m = _haversine_meters(latitude, longitude, centroid["lat"], centroid["lng"])
+        if distance_m > radius_m * 1.15:
+            continue
+
+        bearing = _bearing_degrees(latitude, longitude, centroid["lat"], centroid["lng"])
+        direction_bucket = _direction_bucket(bearing)
+        direction_group = _direction_group(direction_bucket)
+        canopy_height_m = _parse_canopy_height_meters(tags)
+        canopy_pressure = min((canopy_height_m / max(distance_m, 5)) * 0.58, 1.8)
+        directional_scores[direction_group] = directional_scores.get(direction_group, 0.0) + canopy_pressure
+
+        nearby_canopy.append(
+            {
+                "id": f"osm-{element.get('type')}-{element.get('id')}",
+                "name": tags.get("name") or tags.get("species") or "Nearby canopy",
+                "kind": tags.get("natural") or tags.get("landuse") or "vegetation",
+                "height_m": _round(canopy_height_m, 1),
+                "distance_m": _round(distance_m, 1),
+                "bearing_degrees": _round(bearing, 0),
+                "direction_bucket": direction_bucket,
+                "direction_group": direction_group,
+                "canopy_pressure": _round(canopy_pressure, 2),
+                "centroid": centroid,
+                "geometry": geometry,
+            }
+        )
+
+    nearby_canopy.sort(
+        key=lambda feature: (
+            -(feature.get("canopy_pressure") or 0),
+            feature.get("distance_m") or 9999,
+        )
+    )
+    nearby_canopy = nearby_canopy[:8]
+    nearest_canopy = (
+        min(nearby_canopy, key=lambda feature: feature.get("distance_m") or 9999)
+        if nearby_canopy
+        else None
+    )
+    strongest_direction = max(directional_scores, key=directional_scores.get)
+
+    if not nearby_canopy:
+        summary = "No nearby mapped canopy features were found in the current planning radius."
+    else:
+        summary = (
+            f"{len(nearby_canopy)} nearby canopy features found. "
+            f"Nearest canopy is about {nearest_canopy.get('distance_m', 0):.0f} m away, "
+            f"with the strongest canopy pressure on the {strongest_direction} side."
+        )
+
+    return {
+        "source": "openstreetmap-overpass",
+        "search_radius_m": radius_m,
+        "canopy_count": len(nearby_canopy),
+        "nearby_canopy": nearby_canopy,
+        "nearest_canopy": nearest_canopy,
+        "directional_pressure": {
+            direction: _round(score, 2)
+            for direction, score in directional_scores.items()
+        },
+        "summary": summary,
+    }
+
+
 def _fetch_terrain_samples(samples: list[dict[str, Any]]):
     locations = "|".join(f"{sample['lat']:.6f},{sample['lng']:.6f}" for sample in samples)
     return _fetch_json(
@@ -427,13 +602,22 @@ def _build_terrain_context(latitude: float, longitude: float, envelope: dict[str
     }
 
 
-def _build_shade_context(building_context: dict[str, Any], terrain_context: dict[str, Any]):
+def _build_shade_context(
+    building_context: dict[str, Any],
+    terrain_context: dict[str, Any],
+    canopy_context: dict[str, Any],
+):
     directional_pressure = building_context.get("directional_pressure") or {}
+    canopy_pressure = canopy_context.get("directional_pressure") or {}
     south_pressure = directional_pressure.get("south", 0) or 0
     east_west_pressure = (directional_pressure.get("east", 0) or 0) + (directional_pressure.get("west", 0) or 0)
+    south_canopy_pressure = canopy_pressure.get("south", 0) or 0
+    east_west_canopy_pressure = (canopy_pressure.get("east", 0) or 0) + (canopy_pressure.get("west", 0) or 0)
     terrain_aspect = terrain_context.get("dominant_aspect") or "flat"
 
-    combined_pressure = south_pressure * 0.8 + east_west_pressure * 0.28
+    building_pressure_score = south_pressure * 0.8 + east_west_pressure * 0.28
+    canopy_pressure_score = south_canopy_pressure * 0.58 + east_west_canopy_pressure * 0.22
+    combined_pressure = building_pressure_score + canopy_pressure_score
     obstruction_risk = _classify_pressure(combined_pressure)
     if terrain_aspect == "north-facing":
         terrain_bias = "less solar-favored"
@@ -445,9 +629,11 @@ def _build_shade_context(building_context: dict[str, Any], terrain_context: dict
     return {
         "obstruction_risk": obstruction_risk,
         "terrain_bias": terrain_bias,
+        "building_pressure_score": _round(building_pressure_score, 2),
+        "canopy_pressure_score": _round(canopy_pressure_score, 2),
         "summary": (
-            f"Structure-driven shade risk reads as {obstruction_risk}, with terrain looking {terrain_bias} "
-            "for open-sky light."
+            f"Combined structure and canopy shade risk reads as {obstruction_risk}, with terrain looking "
+            f"{terrain_bias} for open-sky light."
         ),
     }
 
@@ -461,23 +647,25 @@ def get_property_context_snapshot(
     envelope = _build_context_envelope(latitude, longitude, bounds)
     building_context = _build_building_context(latitude, longitude, envelope)
     terrain_context = _build_terrain_context(latitude, longitude, envelope)
-    shade_context = _build_shade_context(building_context, terrain_context)
+    canopy_context = _build_canopy_context(latitude, longitude, envelope)
+    shade_context = _build_shade_context(building_context, terrain_context, canopy_context)
 
     return {
-        "context_version": "property-context-v1",
+        "context_version": "property-context-v2",
         "latitude": round(latitude, 6),
         "longitude": round(longitude, 6),
         "match_quality": match_quality or "unknown",
         "match_envelope": envelope,
         "building_context": building_context,
+        "canopy_context": canopy_context,
         "terrain_context": terrain_context,
         "shade_context": shade_context,
         "summary": (
-            f"{building_context.get('summary')} {terrain_context.get('summary')} "
+            f"{building_context.get('summary')} {canopy_context.get('summary')} {terrain_context.get('summary')} "
             f"{shade_context.get('summary')}"
         ),
         "model_note": (
-            "This first context layer uses nearby OpenStreetMap building footprints and SRTM terrain samples. "
-            "It does not include trees, fences, or parcel-certified boundaries yet."
+            "This context layer uses nearby OpenStreetMap building and vegetation features plus SRTM terrain samples. "
+            "It still does not include parcel-certified boundaries, fence lines, or tree-perfect canopy geometry."
         ),
     }
