@@ -1,4 +1,5 @@
 import unittest
+from os import environ
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -49,6 +50,24 @@ class GeocodeSelectionTests(unittest.TestCase):
 
     def tearDown(self):
         data_persistence.reset_memory_storage()
+
+    def test_build_nominatim_geolocator_uses_defaults_for_blank_env_values(self):
+        with patch.object(main, "Nominatim") as mock_nominatim:
+            with patch.dict(
+                environ,
+                {
+                    "GEOCODER_USER_AGENT": "   ",
+                    "GEOCODER_NOMINATIM_DOMAIN": "",
+                    "GEOCODER_NOMINATIM_SCHEME": "   ",
+                },
+                clear=False,
+            ):
+                main.build_nominatim_geolocator()
+
+        _, kwargs = mock_nominatim.call_args
+        self.assertEqual(kwargs["user_agent"], "solar_potential_app")
+        self.assertEqual(kwargs["domain"], "nominatim.openstreetmap.org")
+        self.assertEqual(kwargs["scheme"], "https")
 
     def test_score_address_match_normalizes_street_suffixes(self):
         requested_address = {

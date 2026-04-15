@@ -159,10 +159,17 @@ ctx.verify_mode = ssl.CERT_NONE
 
 
 def build_nominatim_geolocator():
+    def get_setting(name, default):
+        value = os.getenv(name)
+        if value is None:
+            return default
+        value = value.strip()
+        return value or default
+
     return Nominatim(
-        user_agent=os.getenv("GEOCODER_USER_AGENT", "solar_potential_app"),
-        domain=os.getenv("GEOCODER_NOMINATIM_DOMAIN", "nominatim.openstreetmap.org"),
-        scheme=os.getenv("GEOCODER_NOMINATIM_SCHEME", "https"),
+        user_agent=get_setting("GEOCODER_USER_AGENT", "solar_potential_app"),
+        domain=get_setting("GEOCODER_NOMINATIM_DOMAIN", "nominatim.openstreetmap.org"),
+        scheme=get_setting("GEOCODER_NOMINATIM_SCHEME", "https"),
         ssl_context=ctx,
     )
 
