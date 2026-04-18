@@ -33,6 +33,7 @@ from timezonefinder import TimezoneFinder
 import re
 from types import SimpleNamespace
 from typing import Optional
+from urllib.parse import urlparse
 
 load_dotenv()
 
@@ -158,18 +159,43 @@ ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
 
 
-def build_nominatim_geolocator():
-    def get_setting(name, default):
-        value = os.getenv(name)
-        if value is None:
-            return default
-        value = value.strip()
-        return value or default
+DEFAULT_NOMINATIM_DOMAIN = "nominatim.openstreetmap.org"
+PUBLIC_NOMINATIM_DOMAINS = {
+    DEFAULT_NOMINATIM_DOMAIN,
+    "www.nominatim.openstreetmap.org",
+}
 
+
+def get_env_setting(name, default=""):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = str(value).strip()
+    return value or default
+
+
+def normalize_domain_value(value):
+    if not value:
+        return ""
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    domain = (parsed.netloc or parsed.path or "").strip().lower()
+    return domain.rstrip("/")
+
+
+def get_configured_nominatim_domain():
+    return normalize_domain_value(get_env_setting("GEOCODER_NOMINATIM_DOMAIN", ""))
+
+
+def has_custom_nominatim_domain():
+    domain = get_configured_nominatim_domain()
+    return bool(domain and domain not in PUBLIC_NOMINATIM_DOMAINS)
+
+
+def build_nominatim_geolocator():
     return Nominatim(
-        user_agent=get_setting("GEOCODER_USER_AGENT", "solar_potential_app"),
-        domain=get_setting("GEOCODER_NOMINATIM_DOMAIN", "nominatim.openstreetmap.org"),
-        scheme=get_setting("GEOCODER_NOMINATIM_SCHEME", "https"),
+        user_agent=get_env_setting("GEOCODER_USER_AGENT", "solar_potential_app"),
+        domain=get_configured_nominatim_domain() or DEFAULT_NOMINATIM_DOMAIN,
+        scheme=get_env_setting("GEOCODER_NOMINATIM_SCHEME", "https"),
         ssl_context=ctx,
     )
 
@@ -245,8 +271,12 @@ def resolve_solar_provider(solar_data):
 
 
 def get_geocoder_provider():
-    provider = normalize_lookup_text(os.getenv("GEOCODER_PROVIDER", "hybrid"))
-    return provider or "hybrid"
+    provider = normalize_lookup_text(get_env_setting("GEOCODER_PROVIDER", "hybrid")) or "hybrid"
+    if provider not in {"arcgis", "hybrid", "nominatim"}:
+        return "arcgis"
+    if provider in {"hybrid", "nominatim"} and not has_custom_nominatim_domain():
+        return "arcgis"
+    return provider
 
 
 def format_address(address):

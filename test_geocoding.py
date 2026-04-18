@@ -69,6 +69,117 @@ class GeocodeSelectionTests(unittest.TestCase):
         self.assertEqual(kwargs["domain"], "nominatim.openstreetmap.org")
         self.assertEqual(kwargs["scheme"], "https")
 
+    def test_get_geocoder_provider_defaults_to_arcgis_without_custom_nominatim(self):
+        with patch.dict(
+            environ,
+            {
+                "GEOCODER_PROVIDER": "hybrid",
+                "GEOCODER_NOMINATIM_DOMAIN": "",
+            },
+            clear=False,
+        ):
+            self.assertEqual(main.get_geocoder_provider(), "arcgis")
+
+    def test_get_geocoder_provider_keeps_hybrid_with_custom_nominatim(self):
+        with patch.dict(
+            environ,
+            {
+                "GEOCODER_PROVIDER": "hybrid",
+                "GEOCODER_NOMINATIM_DOMAIN": "nominatim.internal.example",
+            },
+            clear=False,
+        ):
+            self.assertEqual(main.get_geocoder_provider(), "hybrid")
+
+    def test_geocode_location_uses_arcgis_main_path_without_custom_nominatim(self):
+        requested_address = {
+            "street": "12518 Boheme Dr",
+            "city": "Houston",
+            "state": "TX",
+            "zip": "77024",
+            "country": "United States",
+        }
+        arcgis_location = main.build_location(
+            "12518 Boheme Dr, Houston, Texas, 77024",
+            29.767836,
+            -95.551491,
+            {
+                "provider": "arcgis",
+                "source": "arcgis-pointaddress",
+                "boundingbox": ["29.767092", "29.769092", "-95.552499", "-95.550499"],
+                "address": {
+                    "house_number": "12518",
+                    "road": "Boheme Dr",
+                    "city": "Houston",
+                    "state": "TX",
+                    "postcode": "77024",
+                    "country": "United States",
+                },
+            },
+        )
+
+        with patch.dict(
+            environ,
+            {
+                "GEOCODER_PROVIDER": "hybrid",
+                "GEOCODER_NOMINATIM_DOMAIN": "",
+            },
+            clear=False,
+        ):
+            with patch.object(main, "fetch_nominatim_candidates", side_effect=AssertionError("should not call Nominatim")):
+                with patch.object(main, "fetch_arcgis_forward_candidates", return_value=[]):
+                    with patch.object(main, "fetch_arcgis_point_address", return_value=arcgis_location):
+                        with patch.object(
+                            main,
+                            "reverse_geocode_arcgis_location",
+                            return_value={
+                                "address": {
+                                    "Address": "12518 Boheme Dr",
+                                    "LongLabel": "12518 Boheme Dr, Houston, TX, 77024, USA",
+                                    "AddNum": "12518",
+                                    "City": "Houston",
+                                    "RegionAbbr": "TX",
+                                    "Postal": "77024",
+                                    "CntryName": "United States",
+                                }
+                            },
+                        ):
+                            result = main.geocode_location(requested_address)
+
+        self.assertEqual(result["source"], "arcgis-pointaddress")
+        self.assertEqual(result["match_quality"], "high")
+
+    def test_reverse_geocode_location_uses_arcgis_without_custom_nominatim(self):
+        with patch.dict(
+            environ,
+            {
+                "GEOCODER_PROVIDER": "hybrid",
+                "GEOCODER_NOMINATIM_DOMAIN": "",
+            },
+            clear=False,
+        ):
+            with patch.object(
+                main,
+                "reverse_geocode_arcgis_location",
+                return_value={
+                    "address": {
+                        "Address": "12518 Boheme Dr",
+                        "LongLabel": "12518 Boheme Dr, Houston, TX, 77024, USA",
+                        "AddNum": "12518",
+                        "City": "Houston",
+                        "RegionAbbr": "TX",
+                        "Postal": "77024",
+                        "CntryName": "United States",
+                    }
+                },
+            ) as arcgis_mock:
+                with patch.object(main.geolocator, "reverse", side_effect=AssertionError("should not call Nominatim reverse")):
+                    location = main.reverse_geocode_location(29.767836, -95.551491)
+
+        arcgis_mock.assert_called_once_with(29.767836, -95.551491)
+        self.assertEqual(location.raw.get("source"), "arcgis-reverse")
+        self.assertEqual(location.raw.get("address", {}).get("postcode"), "77024")
+
     def test_score_address_match_normalizes_street_suffixes(self):
         requested_address = {
             "street": "12518 Boheme Dr",
@@ -124,10 +235,18 @@ class GeocodeSelectionTests(unittest.TestCase):
             ),
         }
 
-        with patch.object(main.geolocator, "geocode", side_effect=lambda *args, **kwargs: next(geocode_results)):
-            with patch.object(main.geolocator, "reverse", side_effect=lambda query, **kwargs: reverse_lookup[query]):
-                with patch.object(main, "fetch_arcgis_point_address", return_value=None):
-                    result = main.geocode_location(requested_address)
+        with patch.dict(
+            environ,
+            {
+                "GEOCODER_PROVIDER": "hybrid",
+                "GEOCODER_NOMINATIM_DOMAIN": "nominatim.internal.example",
+            },
+            clear=False,
+        ):
+            with patch.object(main.geolocator, "geocode", side_effect=lambda *args, **kwargs: next(geocode_results)):
+                with patch.object(main.geolocator, "reverse", side_effect=lambda query, **kwargs: reverse_lookup[query]):
+                    with patch.object(main, "fetch_arcgis_point_address", return_value=None):
+                        result = main.geocode_location(requested_address)
 
         self.assertIs(result["location"], exact_candidate)
         self.assertEqual(result["match_quality"], "high")
@@ -173,34 +292,42 @@ class GeocodeSelectionTests(unittest.TestCase):
             },
         )
 
-        with patch.object(main.geolocator, "geocode", side_effect=[[road_backed_candidate], [road_backed_candidate]]):
-            with patch.object(
-                main.geolocator,
-                "reverse",
-                return_value=FakeLocation(
-                    address="12518 Boheme Drive, Houston, Texas 77024, United States",
-                    latitude=29.767210,
-                    longitude=-95.550680,
-                    raw={"address": build_raw_address("12518", "Boheme Drive")},
-                ),
-            ):
-                with patch.object(main, "fetch_arcgis_point_address", return_value=arcgis_location):
-                    with patch.object(
-                        main,
-                        "reverse_geocode_arcgis_location",
-                        return_value={
-                            "address": {
-                                "Address": "12518 Boheme Dr",
-                                "LongLabel": "12518 Boheme Dr, Houston, TX, 77024, USA",
-                                "AddNum": "12518",
-                                "City": "Houston",
-                                "RegionAbbr": "TX",
-                                "Postal": "77024",
-                                "CntryName": "United States",
-                            }
-                        },
-                    ):
-                        result = main.geocode_location(requested_address)
+        with patch.dict(
+            environ,
+            {
+                "GEOCODER_PROVIDER": "hybrid",
+                "GEOCODER_NOMINATIM_DOMAIN": "nominatim.internal.example",
+            },
+            clear=False,
+        ):
+            with patch.object(main.geolocator, "geocode", side_effect=[[road_backed_candidate], [road_backed_candidate]]):
+                with patch.object(
+                    main.geolocator,
+                    "reverse",
+                    return_value=FakeLocation(
+                        address="12518 Boheme Drive, Houston, Texas 77024, United States",
+                        latitude=29.767210,
+                        longitude=-95.550680,
+                        raw={"address": build_raw_address("12518", "Boheme Drive")},
+                    ),
+                ):
+                    with patch.object(main, "fetch_arcgis_point_address", return_value=arcgis_location):
+                        with patch.object(
+                            main,
+                            "reverse_geocode_arcgis_location",
+                            return_value={
+                                "address": {
+                                    "Address": "12518 Boheme Dr",
+                                    "LongLabel": "12518 Boheme Dr, Houston, TX, 77024, USA",
+                                    "AddNum": "12518",
+                                    "City": "Houston",
+                                    "RegionAbbr": "TX",
+                                    "Postal": "77024",
+                                    "CntryName": "United States",
+                                }
+                            },
+                        ):
+                            result = main.geocode_location(requested_address)
 
         self.assertEqual(result["source"], "arcgis-pointaddress")
         self.assertAlmostEqual(result["location"].latitude, 29.767836, places=6)
@@ -246,42 +373,50 @@ class GeocodeSelectionTests(unittest.TestCase):
             },
         )
 
-        with patch.object(main.geolocator, "geocode", side_effect=[[nominatim_candidate], [nominatim_candidate]]):
-            with patch.object(
-                main.geolocator,
-                "reverse",
-                return_value=FakeLocation(
-                    address="CVS Pharmacy, Benignus Road, Houston, Texas 77024, United States",
-                    latitude=29.7670505,
-                    longitude=-95.5505829,
-                    raw={
-                        "address": {
-                            "road": "Benignus Road",
-                            "city": "Houston",
-                            "state": "Texas",
-                            "postcode": "77024",
-                            "country": "United States",
-                        }
-                    },
-                ),
-            ):
-                with patch.object(main, "fetch_arcgis_point_address", return_value=arcgis_location):
-                    with patch.object(
-                        main,
-                        "reverse_geocode_arcgis_location",
-                        return_value={
+        with patch.dict(
+            environ,
+            {
+                "GEOCODER_PROVIDER": "hybrid",
+                "GEOCODER_NOMINATIM_DOMAIN": "nominatim.internal.example",
+            },
+            clear=False,
+        ):
+            with patch.object(main.geolocator, "geocode", side_effect=[[nominatim_candidate], [nominatim_candidate]]):
+                with patch.object(
+                    main.geolocator,
+                    "reverse",
+                    return_value=FakeLocation(
+                        address="CVS Pharmacy, Benignus Road, Houston, Texas 77024, United States",
+                        latitude=29.7670505,
+                        longitude=-95.5505829,
+                        raw={
                             "address": {
-                                "Address": "12518 Boheme Dr",
-                                "LongLabel": "12518 Boheme Dr, Houston, TX, 77024, USA",
-                                "AddNum": "12518",
-                                "City": "Houston",
-                                "RegionAbbr": "TX",
-                                "Postal": "77024",
-                                "CntryName": "United States",
+                                "road": "Benignus Road",
+                                "city": "Houston",
+                                "state": "Texas",
+                                "postcode": "77024",
+                                "country": "United States",
                             }
                         },
-                    ):
-                        result = main.geocode_location(requested_address)
+                    ),
+                ):
+                    with patch.object(main, "fetch_arcgis_point_address", return_value=arcgis_location):
+                        with patch.object(
+                            main,
+                            "reverse_geocode_arcgis_location",
+                            return_value={
+                                "address": {
+                                    "Address": "12518 Boheme Dr",
+                                    "LongLabel": "12518 Boheme Dr, Houston, TX, 77024, USA",
+                                    "AddNum": "12518",
+                                    "City": "Houston",
+                                    "RegionAbbr": "TX",
+                                    "Postal": "77024",
+                                    "CntryName": "United States",
+                                }
+                            },
+                        ):
+                            result = main.geocode_location(requested_address)
 
         self.assertEqual(result["source"], "arcgis-pointaddress")
         self.assertAlmostEqual(result["location"].latitude, 29.768092, places=6)
