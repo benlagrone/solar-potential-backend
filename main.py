@@ -19,9 +19,11 @@ from data_persistence import (
 from property_context import get_property_context_snapshot
 from live_conditions import (
     get_property_climate_snapshot,
+    get_space_weather_history,
     get_space_weather_snapshot,
     get_surface_irradiance_snapshot,
 )
+from utility_context import resolve_utility_context
 import uuid
 from geopy.geocoders import Nominatim
 from datetime import datetime, timedelta
@@ -112,6 +114,7 @@ class SolarPotentialRequest(BaseModel):
     system_size: Optional[float] = 7.0  # retained for backward compatibility
     panel_efficiency: float = 0.20  # default 20%
     electricity_rate: float  # in $/kWh
+    electricity_rate_mode: str = "auto"
     installation_cost_per_watt: float = 3.0  # in $/W, default $3/W
     roof_selection: Optional[RoofSelection] = None
 
@@ -120,6 +123,7 @@ class SolarReportRequest(BaseModel):
     guid: str
     panel_efficiency: float = 0.20
     electricity_rate: float
+    electricity_rate_mode: str = "auto"
     installation_cost_per_watt: float = 3.0
     roof_selection: Optional[RoofSelection] = None
     report_name: Optional[str] = None
@@ -145,6 +149,7 @@ class Coordinates(BaseModel):
     latitude: float
     longitude: float
     force_refresh: bool = False
+    guid: Optional[str] = None
 
 
 class PropertyContextRequest(BaseModel):
@@ -152,6 +157,15 @@ class PropertyContextRequest(BaseModel):
     longitude: float
     bounds: Optional[PreviewBounds] = None
     match_quality: Optional[str] = None
+
+
+class SpaceWeatherHistoryRequest(BaseModel):
+    latitude: float
+    longitude: float
+    days: int = 7
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    force_refresh: bool = False
 
 # Create a custom SSL context
 ctx = ssl.create_default_context(cafile=certifi.where())
@@ -1622,6 +1636,7 @@ def build_solar_assumptions(
     roof_selection,
     panel_efficiency,
     electricity_rate,
+    rate_assumption_source,
     installation_cost_per_watt,
     data_source,
     solar_provider,
@@ -1664,7 +1679,7 @@ def build_solar_assumptions(
         system_size_assumption,
         production_assumption,
         f"Panel efficiency is assumed at {normalized_efficiency * 100:.0f}%.",
-        f"Electricity rate is assumed at ${electricity_rate:.2f}/kWh.",
+        f"Electricity rate is assumed at ${electricity_rate:.2f}/kWh from {rate_assumption_source}.",
         f"Installed cost is assumed at ${installation_cost_per_watt:.2f}/W.",
         data_source_assumption,
     ]
@@ -1788,6 +1803,11 @@ def build_solar_report_name(address):
     return f"{street} solar report · {timestamp_label}"
 
 
+def normalize_electricity_rate_mode(value):
+    normalized = str(value or "auto").strip().lower()
+    return "manual" if normalized == "manual" else "auto"
+
+
 def build_saved_solar_report(address, estimate, report_name=None):
     return {
         "id": str(uuid.uuid4()),
@@ -1803,6 +1823,11 @@ def build_saved_solar_report(address, estimate, report_name=None):
         "data_source": estimate["data_source"],
         "data_provider": estimate.get("data_provider"),
         "data_quality": estimate["data_quality"],
+        "electricity_rate_mode": estimate.get("electricity_rate_mode"),
+        "electricity_rate_input": estimate.get("electricity_rate_input"),
+        "electricity_rate_used": estimate.get("electricity_rate_used"),
+        "rate_assumption_source": estimate.get("rate_assumption_source"),
+        "utility_context": estimate.get("utility_context"),
         "roof_area_square_feet": estimate["roof_area_square_feet"],
         "roof_area_square_meters": estimate["roof_area_square_meters"],
         "production_model": estimate["production_model"],
@@ -2049,6 +2074,53 @@ def build_solar_estimate_response(input_data):
     if lat is None or lon is None:
         raise HTTPException(status_code=500, detail="Unable to determine latitude and longitude")
 
+    electricity_rate_mode = normalize_electricity_rate_mode(
+        getattr(input_data, "electricity_rate_mode", "auto")
+    )
+    manual_electricity_rate = round(float(input_data.electricity_rate), 4)
+    utility_context = None
+    try:
+        utility_context = resolve_utility_context(address, lat, lon)
+    except requests.RequestException as exc:
+        logger.warning("Utility context upstream request failed: %s", str(exc))
+    except Exception as exc:
+        logger.warning("Utility context resolution failed: %s", str(exc))
+
+    utility_rate = None
+    if utility_context:
+        utility_rate = utility_context.get("blended_kwh_rate")
+        utility_context = {
+            **utility_context,
+            "manual_rate_fallback": manual_electricity_rate,
+        }
+
+    if electricity_rate_mode == "auto" and utility_rate is not None:
+        effective_electricity_rate = round(float(utility_rate), 4)
+        rate_assumption_source = utility_context.get("rate_source") or "utility-aware rate"
+        utility_context = {
+            **(utility_context or {}),
+            "applied_rate": True,
+            "applied_rate_mode": "utility-auto",
+        }
+    elif electricity_rate_mode == "auto":
+        effective_electricity_rate = manual_electricity_rate
+        rate_assumption_source = "manual fallback because no utility-aware rate was available"
+        if utility_context:
+            utility_context = {
+                **utility_context,
+                "applied_rate": False,
+                "applied_rate_mode": "manual-fallback",
+            }
+    else:
+        effective_electricity_rate = manual_electricity_rate
+        rate_assumption_source = "manual input"
+        if utility_context:
+            utility_context = {
+                **utility_context,
+                "applied_rate": False,
+                "applied_rate_mode": "manual-override",
+            }
+
     property_context = property_record.get("property_context")
     modeling_context = build_solar_modeling_context(
         lat,
@@ -2107,7 +2179,7 @@ def build_solar_estimate_response(input_data):
             system_size_kw,
             estimate_solar_data,
             input_data.panel_efficiency,
-            input_data.electricity_rate,
+            effective_electricity_rate,
             modeling_context,
         )
     else:
@@ -2116,13 +2188,13 @@ def build_solar_estimate_response(input_data):
             monthly_all_sky,
             avg_all_sky_radiation,
             input_data.panel_efficiency,
-            input_data.electricity_rate,
+            effective_electricity_rate,
             roof_selection,
             modeling_context,
         )
     annual_production = production_model["annual_production"]
     daily_production = production_model["daily_production"]
-    annual_savings = round(annual_production * input_data.electricity_rate, 2)
+    annual_savings = round(annual_production * effective_electricity_rate, 2)
     system_cost = round(system_size_kw * 1000 * input_data.installation_cost_per_watt, 2)
     payback_period = round(system_cost / annual_savings, 2) if annual_savings > 0 else None
     total_savings = round(sum([annual_savings * (1.02 ** year) for year in range(25)]), 2)
@@ -2141,7 +2213,8 @@ def build_solar_estimate_response(input_data):
         sizing_source,
         roof_selection,
         input_data.panel_efficiency,
-        input_data.electricity_rate,
+        effective_electricity_rate,
+        rate_assumption_source,
         input_data.installation_cost_per_watt,
         estimate_data_source or "unknown",
         model_provider,
@@ -2179,6 +2252,11 @@ def build_solar_estimate_response(input_data):
         "match_quality": match_quality,
         "system_size_kw": system_size_kw,
         "sizing_source": sizing_source,
+        "electricity_rate_mode": electricity_rate_mode,
+        "electricity_rate_input": manual_electricity_rate,
+        "electricity_rate_used": effective_electricity_rate,
+        "rate_assumption_source": rate_assumption_source,
+        "utility_context": utility_context,
         "roof_area_square_feet": roof_selection.get("areaSquareFeet") if roof_selection else None,
         "roof_area_square_meters": roof_selection.get("areaSquareMeters") if roof_selection else None,
         "assumptions": assumptions,
@@ -2389,6 +2467,35 @@ def get_space_weather(coordinates: Coordinates):
 
 
 @app.post(
+    "/api/space-weather/history",
+    response_model=dict,
+    summary="Get Space Weather History",
+    description="Returns recent NASA DONKI flare and geomagnetic-storm history localized to the provided coordinates.",
+)
+def get_space_weather_history_endpoint(payload: SpaceWeatherHistoryRequest):
+    time_zone = get_timezone(payload.latitude, payload.longitude) or "UTC"
+    try:
+        return get_space_weather_history(
+            payload.latitude,
+            payload.longitude,
+            time_zone,
+            days=payload.days,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+            force_refresh=payload.force_refresh,
+        )
+    except requests.HTTPError as exc:
+        logger.error("Space weather history upstream request failed: %s", str(exc))
+        raise HTTPException(status_code=502, detail="Unable to load space weather history data")
+    except ValueError as exc:
+        logger.error("Space weather history request failed validation: %s", str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("Space weather history processing failed: %s", str(exc))
+        raise HTTPException(status_code=500, detail="Unable to process space weather history data")
+
+
+@app.post(
     "/api/surface-irradiance",
     response_model=dict,
     summary="Get Surface Irradiance",
@@ -2396,12 +2503,18 @@ def get_space_weather(coordinates: Coordinates):
 )
 def get_surface_irradiance(coordinates: Coordinates):
     time_zone = get_timezone(coordinates.latitude, coordinates.longitude) or "UTC"
+    property_context = None
+    if coordinates.guid:
+        property_record = get_property_record(coordinates.guid)
+        if property_record:
+            property_context = property_record.get("property_context")
     try:
         return get_surface_irradiance_snapshot(
             coordinates.latitude,
             coordinates.longitude,
             time_zone,
             force_refresh=coordinates.force_refresh,
+            property_context=property_context,
         )
     except requests.HTTPError as exc:
         logger.error("Surface irradiance upstream request failed: %s", str(exc))
@@ -2477,6 +2590,7 @@ def save_solar_report(payload: SolarReportRequest):
         system_size=None,
         panel_efficiency=payload.panel_efficiency,
         electricity_rate=payload.electricity_rate,
+        electricity_rate_mode=payload.electricity_rate_mode,
         installation_cost_per_watt=payload.installation_cost_per_watt,
         roof_selection=payload.roof_selection,
     )

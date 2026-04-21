@@ -7,6 +7,7 @@ import math
 import time
 from statistics import median
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -393,6 +394,22 @@ def _parse_time(value: Optional[str]):
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _safe_timezone(time_zone_name: Optional[str]):
+    try:
+        return ZoneInfo(str(time_zone_name or "UTC"))
+    except Exception:
+        return timezone.utc
+
+
+def _localize_time(value: Optional[str], time_zone_name: Optional[str]):
+    parsed_time = _parse_time(value)
+    if not parsed_time:
+        return None
+    if parsed_time.tzinfo is None:
+        parsed_time = parsed_time.replace(tzinfo=timezone.utc)
+    return parsed_time.astimezone(_safe_timezone(time_zone_name))
 
 
 def _format_scale(bucket: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -1333,6 +1350,283 @@ def _build_surface_reasons(
     ]
 
 
+def _build_surface_site_context(property_context: Optional[dict[str, Any]]):
+    if not isinstance(property_context, dict):
+        return {
+            "available": False,
+            "tone": "neutral",
+            "summary": (
+                "This remains an open-sky irradiance forecast because no saved parcel context is "
+                "available for nearby buildings, canopy, or terrain."
+            ),
+        }
+
+    building_context = property_context.get("building_context") or {}
+    canopy_context = property_context.get("canopy_context") or {}
+    terrain_context = property_context.get("terrain_context") or {}
+    shade_context = property_context.get("shade_context") or {}
+    building_count = int(_safe_float(building_context.get("building_count"), 0))
+    canopy_count = int(_safe_float(canopy_context.get("canopy_count"), 0))
+    building_directional = building_context.get("directional_pressure") or {}
+    canopy_directional = canopy_context.get("directional_pressure") or {}
+    directional_pressure = {}
+    for direction in ("north", "south", "east", "west"):
+        directional_pressure[direction] = round(
+            _safe_float(building_directional.get(direction))
+            + _safe_float(canopy_directional.get(direction)),
+            2,
+        )
+
+    strongest_direction = None
+    strongest_pressure = 0.0
+    if directional_pressure:
+        strongest_direction, strongest_pressure = max(
+            directional_pressure.items(),
+            key=lambda item: item[1],
+        )
+
+    obstruction_risk = (
+        shade_context.get("obstruction_risk")
+        or building_context.get("obstruction_risk")
+        or "low"
+    )
+    if obstruction_risk == "high" or strongest_pressure >= 1.2:
+        tone = "alert"
+    elif obstruction_risk in {"moderate", "medium"} or strongest_pressure >= 0.45:
+        tone = "watch"
+    else:
+        tone = "low"
+
+    terrain_bias = (
+        shade_context.get("terrain_bias")
+        or terrain_context.get("dominant_aspect")
+        or "unknown"
+    )
+    strongest_phrase = (
+        f"strongest toward the {strongest_direction} side"
+        if strongest_direction
+        else "without a clear dominant side"
+    )
+
+    return {
+        "available": True,
+        "tone": tone,
+        "obstruction_risk": obstruction_risk,
+        "building_count": building_count,
+        "canopy_count": canopy_count,
+        "terrain_class": terrain_context.get("terrain_class"),
+        "terrain_bias": terrain_bias,
+        "strongest_direction": strongest_direction,
+        "strongest_pressure": round(strongest_pressure, 2),
+        "directional_pressure": directional_pressure,
+        "summary": (
+            f"Saved parcel context suggests {obstruction_risk} local obstruction pressure, {strongest_phrase}, "
+            f"from {building_count} nearby buildings and {canopy_count} canopy features."
+        ),
+        "model_note": (
+            "This still uses an open-sky irradiance forecast. Saved property context only adds a "
+            "local interpretation layer; it does not ray-trace parcel-level shading minute by minute."
+        ),
+    }
+
+
+def _normalize_history_window(
+    *,
+    days: int = 7,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    default_window = max(1, min(int(days or 7), 90))
+    today = datetime.now(timezone.utc).date()
+    parsed_start = None
+    parsed_end = None
+
+    if start_date:
+        parsed_start = date.fromisoformat(start_date)
+    if end_date:
+        parsed_end = date.fromisoformat(end_date)
+
+    if parsed_start and parsed_end:
+        if parsed_start > parsed_end:
+            parsed_start, parsed_end = parsed_end, parsed_start
+    elif parsed_start:
+        parsed_end = min(today, parsed_start + timedelta(days=default_window - 1))
+    elif parsed_end:
+        parsed_end = min(today, parsed_end)
+        parsed_start = parsed_end - timedelta(days=default_window - 1)
+    else:
+        parsed_end = today
+        parsed_start = parsed_end - timedelta(days=default_window - 1)
+
+    if parsed_end > today:
+        parsed_end = today
+    if parsed_start > parsed_end:
+        parsed_start = parsed_end
+
+    actual_days = max((parsed_end - parsed_start).days + 1, 1)
+    return parsed_start, parsed_end, actual_days
+
+
+def _flare_class_strength(class_type: Optional[str]) -> float:
+    normalized = str(class_type or "").strip().upper()
+    if not normalized:
+        return 0.0
+    scale = {
+        "A": 0,
+        "B": 1,
+        "C": 2,
+        "M": 3,
+        "X": 4,
+    }.get(normalized[:1], 0)
+    magnitude = _safe_float(normalized[1:], 0.0)
+    return (scale * 100.0) + magnitude
+
+
+def _flare_tone(class_type: Optional[str]) -> str:
+    normalized = str(class_type or "").strip().upper()
+    if normalized.startswith("X"):
+        return "alert"
+    if normalized.startswith("M"):
+        return "watch"
+    if normalized.startswith("C"):
+        return "low"
+    return "neutral"
+
+
+def _flare_local_relevance(class_type: Optional[str], *, is_daylight: bool):
+    if not is_daylight:
+        return {
+            "tone": "low",
+            "label": "Night-side local radio relevance",
+            "detail": (
+                "The flare peaked on the local night side, so daylight-side radio-blackout relevance "
+                "to this property was muted."
+            ),
+        }
+
+    tone = _flare_tone(class_type)
+    if tone == "alert":
+        return {
+            "tone": "alert",
+            "label": "Daylight-side flare relevance",
+            "detail": (
+                "This flare peaked during local daylight, which is when flare-driven radio-blackout "
+                "effects are most relevant to this property."
+            ),
+        }
+    if tone == "watch":
+        return {
+            "tone": "watch",
+            "label": "Moderate daylight-side relevance",
+            "detail": (
+                "This flare peaked during local daylight, so it had some local radio-blackout relevance "
+                "even if broader residential effects stayed limited."
+            ),
+        }
+    return {
+        "tone": "low",
+        "label": "Low local flare relevance",
+        "detail": (
+            "This flare stayed below the stronger M/X classes, so local daylight-side effects were limited."
+        ),
+    }
+
+
+def _storm_tone(max_kp_index: float) -> str:
+    if max_kp_index >= 7:
+        return "alert"
+    if max_kp_index >= 5:
+        return "watch"
+    if max_kp_index >= 4:
+        return "low"
+    return "neutral"
+
+
+def _storm_local_relevance(max_kp_index: float, latitude_band: str):
+    if latitude_band == "high":
+        if max_kp_index >= 7:
+            tone = "alert"
+        elif max_kp_index >= 5:
+            tone = "watch"
+        else:
+            tone = "low"
+    elif latitude_band == "mid":
+        if max_kp_index >= 7:
+            tone = "alert"
+        elif max_kp_index >= 5:
+            tone = "watch"
+        else:
+            tone = "low"
+    elif latitude_band == "low":
+        tone = "watch" if max_kp_index >= 7 else "low"
+    else:
+        tone = "watch" if max_kp_index >= 8 else "low"
+
+    if tone == "alert":
+        detail = (
+            f"This latitude band is exposed enough that a Kp {max_kp_index:.1f} storm could matter "
+            "locally for aurora reach, GNSS accuracy, or HF conditions."
+        )
+    elif tone == "watch":
+        detail = (
+            f"This latitude band can start to matter under a Kp {max_kp_index:.1f} storm, mainly "
+            "through aurora reach and navigation/timing effects."
+        )
+    else:
+        detail = (
+            f"At this latitude band, a Kp {max_kp_index:.1f} storm usually keeps the strongest "
+            "effects poleward of the property."
+        )
+
+    return {
+        "tone": tone,
+        "label": f"{format_label(latitude_band)} latitude-band relevance",
+        "detail": detail,
+    }
+
+
+def format_label(value: Optional[str]):
+    normalized = str(value or "unknown").replace("_", " ").replace("-", " ").strip()
+    return normalized.capitalize() if normalized else "Unknown"
+
+
+def _build_space_weather_history_summary(
+    days: int,
+    flare_count: int,
+    storm_count: int,
+    strongest_flare_class: Optional[str],
+    strongest_storm_kp: Optional[float],
+    latitude_band: str,
+):
+    activity_bits = []
+    if flare_count:
+        activity_bits.append(
+            f"{flare_count} flare event{'s' if flare_count != 1 else ''}"
+        )
+    if storm_count:
+        activity_bits.append(
+            f"{storm_count} geomagnetic storm{'s' if storm_count != 1 else ''}"
+        )
+    if not activity_bits:
+        return (
+            f"No NASA DONKI flare or geomagnetic storm events were returned for the last {days} days."
+        )
+
+    strongest_bits = []
+    if strongest_flare_class:
+        strongest_bits.append(f"strongest flare {strongest_flare_class}")
+    if strongest_storm_kp is not None:
+        strongest_bits.append(f"strongest storm Kp {strongest_storm_kp:.1f}")
+
+    strength_summary = ", ".join(strongest_bits)
+    return (
+        f"The last {days} days included {' and '.join(activity_bits)} for this {latitude_band} latitude band, "
+        f"with {strength_summary}."
+        if strength_summary
+        else f"The last {days} days included {' and '.join(activity_bits)} for this {latitude_band} latitude band."
+    )
+
+
 def _build_recent_headlines(alerts_payload: Any) -> tuple[int, int, int, list[str]]:
     warning_count = 0
     watch_count = 0
@@ -1621,6 +1915,7 @@ def get_surface_irradiance_snapshot(
     longitude: float,
     time_zone_name: str,
     force_refresh: bool = False,
+    property_context: Optional[dict[str, Any]] = None,
 ):
     forecast_response = _build_open_meteo_payload(
         latitude,
@@ -1672,8 +1967,9 @@ def get_surface_irradiance_snapshot(
 
     intensity_level = _intensity_level(current_ghi, is_daylight)
     spike_level = _spike_level(max_hourly_ramp, peak_ghi, is_daylight)
+    site_context = _build_surface_site_context(property_context)
     hourly_profile = []
-    for index, time_value in enumerate(future_times[:8]):
+    for index, time_value in enumerate(future_times[:24]):
         hourly_profile.append(
             {
                 "time": time_value,
@@ -1687,6 +1983,39 @@ def get_surface_irradiance_snapshot(
             "open-meteo-forecast": forecast_response.get("freshness") or {},
         }
     )
+
+    reasons = _build_surface_reasons(
+        is_daylight,
+        intensity_level,
+        spike_level,
+        current_ghi,
+        peak_time,
+        peak_ghi,
+        change_to_next_hour,
+        round(max_hourly_ramp, 1),
+    )
+    if site_context.get("available"):
+        reasons.append(
+            {
+                "id": "site-context",
+                "label": f"Saved site context {site_context.get('obstruction_risk') or 'unknown'}",
+                "tone": site_context.get("tone") or "neutral",
+                "detail": (
+                    f"{site_context.get('summary')} {site_context.get('model_note')}"
+                ),
+            }
+        )
+
+    summary = _build_surface_summary(
+        is_daylight,
+        current_ghi,
+        peak_time,
+        peak_ghi,
+        spike_level,
+        change_to_next_hour,
+    )
+    if site_context.get("available"):
+        summary = f"{summary} {site_context.get('summary')}"
 
     return {
         "latitude": round(latitude, 6),
@@ -1715,26 +2044,11 @@ def get_surface_irradiance_snapshot(
             "dni_w_m2": peak_dni,
         },
         "spike_level": spike_level,
-        "summary": _build_surface_summary(
-            is_daylight,
-            current_ghi,
-            peak_time,
-            peak_ghi,
-            spike_level,
-            change_to_next_hour,
-        ),
+        "summary": summary,
         "freshness": freshness,
-        "reasons": _build_surface_reasons(
-            is_daylight,
-            intensity_level,
-            spike_level,
-            current_ghi,
-            peak_time,
-            peak_ghi,
-            change_to_next_hour,
-            round(max_hourly_ramp, 1),
-        ),
+        "reasons": reasons,
         "hourly_profile": hourly_profile,
+        "site_context": site_context,
     }
 
 
@@ -2205,5 +2519,173 @@ def get_space_weather_snapshot(
             "noaa-glotec",
             "nasa-donki",
             "open-meteo-forecast",
+        ],
+    }
+
+
+def get_space_weather_history(
+    latitude: float,
+    longitude: float,
+    time_zone_name: str,
+    *,
+    days: int = 7,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    force_refresh: bool = False,
+):
+    start_day, end_day, actual_days = _normalize_history_window(
+        days=days,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    flares_response = _fetch_json(
+        NASA_DONKI_FLR_URL,
+        params={
+            "startDate": start_day.isoformat(),
+            "endDate": end_day.isoformat(),
+        },
+        ttl_seconds=1800,
+        force_refresh=force_refresh,
+        return_metadata=True,
+        source_name="nasa-donki-flares",
+    )
+    storms_response = _fetch_json(
+        NASA_DONKI_GST_URL,
+        params={
+            "startDate": start_day.isoformat(),
+            "endDate": end_day.isoformat(),
+        },
+        ttl_seconds=1800,
+        force_refresh=force_refresh,
+        return_metadata=True,
+        source_name="nasa-donki-geomagnetic-storms",
+    )
+    flares_payload = flares_response.get("data") or []
+    storms_payload = storms_response.get("data") or []
+    latitude_band = _latitude_band(latitude)
+    events = []
+
+    for flare in flares_payload if isinstance(flares_payload, list) else []:
+        observed_at = flare.get("peakTime") or flare.get("beginTime")
+        local_time = _localize_time(observed_at, time_zone_name)
+        local_relevance = _flare_local_relevance(
+            flare.get("classType"),
+            is_daylight=bool(local_time and 6 <= local_time.hour < 18),
+        )
+        events.append(
+            {
+                "id": f"flare-{observed_at or len(events)}",
+                "kind": "flare",
+                "label": flare.get("classType") or "Solar flare",
+                "tone": _flare_tone(flare.get("classType")),
+                "observed_at": observed_at,
+                "local_time": local_time.isoformat() if local_time else None,
+                "detail": (
+                    f"{flare.get('classType') or 'Unclassified'} flare from "
+                    f"{flare.get('sourceLocation') or 'an unspecified source region'}."
+                ),
+                "source_location": flare.get("sourceLocation"),
+                "global_severity": {
+                    "class": flare.get("classType"),
+                },
+                "local_relevance": local_relevance,
+            }
+        )
+
+    for storm in storms_payload if isinstance(storms_payload, list) else []:
+        kp_index = 0.0
+        peak_time = None
+        for entry in storm.get("allKpIndex") or []:
+            entry_kp = _safe_float(entry.get("kpIndex"))
+            if entry_kp >= kp_index:
+                kp_index = entry_kp
+                peak_time = entry.get("observedTime") or peak_time
+
+        observed_at = peak_time or storm.get("startTime")
+        local_time = _localize_time(observed_at, time_zone_name)
+        local_relevance = _storm_local_relevance(kp_index, latitude_band)
+        events.append(
+            {
+                "id": f"storm-{observed_at or len(events)}",
+                "kind": "geomagnetic-storm",
+                "label": f"Kp {kp_index:.1f}" if kp_index else "Geomagnetic storm",
+                "tone": _storm_tone(kp_index),
+                "observed_at": observed_at,
+                "local_time": local_time.isoformat() if local_time else None,
+                "detail": (
+                    f"Geomagnetic storm window with a reported peak near Kp {kp_index:.1f}."
+                    if kp_index
+                    else "Geomagnetic storm window reported by DONKI."
+                ),
+                "global_severity": {
+                    "max_kp_index": round(kp_index, 2),
+                    "start_time": storm.get("startTime"),
+                },
+                "local_relevance": local_relevance,
+            }
+        )
+
+    events.sort(
+        key=lambda event: _parse_time(event.get("observed_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+    strongest_flare_class = None
+    strongest_flare_strength = 0.0
+    for event in events:
+        if event.get("kind") != "flare":
+            continue
+        class_type = (event.get("global_severity") or {}).get("class")
+        strength = _flare_class_strength(class_type)
+        if strength > strongest_flare_strength:
+            strongest_flare_strength = strength
+            strongest_flare_class = class_type
+
+    strongest_storm_kp = None
+    for event in events:
+        if event.get("kind") != "geomagnetic-storm":
+            continue
+        max_kp_index = _safe_float((event.get("global_severity") or {}).get("max_kp_index"))
+        if strongest_storm_kp is None or max_kp_index > strongest_storm_kp:
+            strongest_storm_kp = max_kp_index
+
+    flare_count = sum(1 for event in events if event.get("kind") == "flare")
+    storm_count = sum(1 for event in events if event.get("kind") == "geomagnetic-storm")
+
+    return {
+        "latitude": round(latitude, 6),
+        "longitude": round(longitude, 6),
+        "time_zone": time_zone_name or "UTC",
+        "start_date": start_day.isoformat(),
+        "end_date": end_day.isoformat(),
+        "days": actual_days,
+        "latitude_band": latitude_band,
+        "summary": _build_space_weather_history_summary(
+            actual_days,
+            flare_count,
+            storm_count,
+            strongest_flare_class,
+            strongest_storm_kp,
+            latitude_band,
+        ),
+        "counts": {
+            "flare_events": flare_count,
+            "geomagnetic_storms": storm_count,
+            "total_events": len(events),
+        },
+        "strongest": {
+            "flare_class": strongest_flare_class,
+            "geomagnetic_kp": round(strongest_storm_kp, 2) if strongest_storm_kp is not None else None,
+        },
+        "events": events,
+        "freshness": _aggregate_freshness(
+            {
+                "nasa-donki-flares": flares_response.get("freshness") or {},
+                "nasa-donki-geomagnetic-storms": storms_response.get("freshness") or {},
+            }
+        ),
+        "sources": [
+            "nasa-donki-flares",
+            "nasa-donki-geomagnetic-storms",
         ],
     }

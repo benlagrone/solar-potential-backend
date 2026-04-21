@@ -319,6 +319,29 @@ class SpaceWeatherEndpointTests(unittest.TestCase):
         self.assertEqual(payload["local"]["aurora_viewline"]["forecast_status"], "unavailable")
         self.assertTrue(payload["freshness"]["sources"]["noaa-ovation-aurora"]["refresh_failed"])
 
+    @patch.object(main, "get_timezone", return_value="America/Chicago")
+    def test_space_weather_history_endpoint_returns_recent_donki_timeline(self, _timezone):
+        with patch.object(live_conditions.requests, "get", side_effect=self._fake_requests_get()):
+            response = self.client.post(
+                "/api/space-weather/history",
+                json={
+                    "latitude": 30.2672,
+                    "longitude": -97.7431,
+                    "days": 7,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["days"], 7)
+        self.assertEqual(payload["counts"]["flare_events"], 1)
+        self.assertEqual(payload["counts"]["geomagnetic_storms"], 1)
+        self.assertEqual(payload["strongest"]["flare_class"], "C4.5")
+        self.assertAlmostEqual(payload["strongest"]["geomagnetic_kp"], 5.33, places=2)
+        self.assertEqual(payload["events"][0]["kind"], "geomagnetic-storm")
+        self.assertIn("nasa-donki-flares", payload["sources"])
+        self.assertIn("nasa-donki-geomagnetic-storms", payload["sources"])
+
 
 if __name__ == "__main__":
     unittest.main()

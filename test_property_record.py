@@ -704,6 +704,58 @@ class PropertyRecordTests(unittest.TestCase):
             )
         )
 
+    def test_solar_potential_uses_utility_aware_rate_when_auto_mode_is_active(self):
+        property_response = self.client.post(
+            "/api/property-record",
+            json={
+                "address": build_address(),
+                "property_preview": build_property_preview(),
+                "roof_selection": build_roof_selection(),
+            },
+        )
+        guid = property_response.json()["guid"]
+
+        utility_context = {
+            "utility_name": "Austin Energy",
+            "rate_name": "Residential average retail price",
+            "rate_source": "OpenEI utility match plus EIA residential retail price",
+            "rate_effective_date": "2026-03",
+            "blended_kwh_rate": 0.221,
+            "confidence": "medium",
+            "net_metering_status": "available",
+            "source_details": {
+                "openei_label": "demo-openei-label",
+                "eia_period": "2026-03",
+            },
+        }
+
+        with patch.object(main, "get_nrel_api_key", return_value=None):
+            with patch.object(main, "check_existing_zip_data", return_value=(None, None)):
+                with patch.object(main, "geocode_address", return_value=(30.2672, -97.7431)):
+                    with patch.object(main, "get_nasa_power_data", return_value=build_solar_data()):
+                        with patch.object(main, "get_timezone", return_value="America/Chicago"):
+                            with patch.object(main, "resolve_utility_context", return_value=utility_context):
+                                response = self.client.post(
+                                    "/api/solar-potential",
+                                    json={
+                                        "guid": guid,
+                                        "panel_efficiency": 0.2,
+                                        "electricity_rate": 0.16,
+                                        "electricity_rate_mode": "auto",
+                                        "installation_cost_per_watt": 3.0,
+                                    },
+                                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["electricity_rate_mode"], "auto")
+        self.assertAlmostEqual(payload["electricity_rate_input"], 0.16, places=3)
+        self.assertAlmostEqual(payload["electricity_rate_used"], 0.221, places=3)
+        self.assertEqual(payload["utility_context"]["utility_name"], "Austin Energy")
+        self.assertTrue(payload["utility_context"]["applied_rate"])
+        self.assertIn("EIA residential retail price", payload["rate_assumption_source"])
+        self.assertAlmostEqual(payload["annual_savings"], round(payload["annual_production"] * 0.221, 2), places=2)
+
     def test_solar_potential_prefers_nrel_pvwatts_when_api_key_is_available(self):
         property_response = self.client.post(
             "/api/property-record",
@@ -1047,6 +1099,46 @@ class PropertyRecordTests(unittest.TestCase):
             -97.7431,
             bounds=build_property_preview()["bounds"],
             match_quality="high",
+        )
+
+    def test_surface_irradiance_endpoint_uses_saved_property_context_when_guid_is_present(self):
+        property_response = self.client.post(
+            "/api/property-record",
+            json={
+                "address": build_address(),
+                "property_preview": build_property_preview(),
+                "property_context": build_property_context(),
+            },
+        )
+        guid = property_response.json()["guid"]
+        irradiance_snapshot = {
+            "latitude": 30.2672,
+            "longitude": -97.7431,
+            "time_zone": "America/Chicago",
+            "summary": "Surface irradiance snapshot",
+            "site_context": {
+                "available": True,
+                "obstruction_risk": "moderate",
+            },
+        }
+
+        with patch.object(main, "get_timezone", return_value="America/Chicago"):
+            with patch.object(main, "get_surface_irradiance_snapshot", return_value=irradiance_snapshot) as mocked_snapshot:
+                response = self.client.post(
+                    "/api/surface-irradiance",
+                    json={
+                        "latitude": 30.2672,
+                        "longitude": -97.7431,
+                        "guid": guid,
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["site_context"]["obstruction_risk"], "moderate")
+        mocked_snapshot.assert_called_once()
+        self.assertEqual(
+            mocked_snapshot.call_args.kwargs["property_context"]["context_version"],
+            "property-context-v2",
         )
 
 
