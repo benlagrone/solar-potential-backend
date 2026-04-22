@@ -704,6 +704,55 @@ class PropertyRecordTests(unittest.TestCase):
             )
         )
 
+    def test_solar_potential_runs_address_context_estimate_without_roof_selection(self):
+        property_response = self.client.post(
+            "/api/property-record",
+            json={
+                "address": build_address(),
+                "property_preview": build_property_preview(),
+                "property_context": build_property_context(),
+            },
+        )
+        guid = property_response.json()["guid"]
+
+        with patch.object(main, "get_nrel_api_key", return_value=None):
+            with patch.object(main, "check_existing_zip_data", return_value=(None, None)):
+                with patch.object(main, "geocode_address", return_value=(30.2672, -97.7431)):
+                    with patch.object(main, "get_nasa_power_data", return_value=build_solar_data()):
+                        with patch.object(main, "get_timezone", return_value="America/Chicago"):
+                            response = self.client.post(
+                                "/api/solar-potential",
+                                json={
+                                    "guid": guid,
+                                    "system_size": 7.2,
+                                    "panel_efficiency": 0.2,
+                                    "electricity_rate": 0.16,
+                                    "installation_cost_per_watt": 3.0,
+                                },
+                            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["sizing_source"], "address-context")
+        self.assertEqual(payload["estimate_mode"], "address-context")
+        self.assertEqual(payload["system_size_kw"], 7.2)
+        self.assertIsNone(payload["roof_area_square_feet"])
+        self.assertIn("Address-only estimate", payload["sizing_note"])
+        self.assertIn("Draw the usable roof area", payload["next_input_needed"])
+        self.assertEqual(payload["production_model"]["id"], "address-context-monthly-v1")
+        self.assertTrue(payload["production_model"]["site_context_available"])
+        self.assertEqual(payload["production_model"]["assumed_azimuth"], 180.0)
+        self.assertAlmostEqual(payload["production_model"]["assumed_tilt"], 32.8, places=1)
+        self.assertGreater(payload["production_model"]["canopy_pressure_score"], 0)
+        self.assertEqual(payload["confidence"]["id"], "medium")
+        self.assertLess(payload["confidence"]["score"], 80)
+        self.assertTrue(
+            any(
+                "address-only kw input" in factor.lower()
+                for factor in payload["confidence"]["factors"]
+            )
+        )
+
     def test_solar_potential_uses_utility_aware_rate_when_auto_mode_is_active(self):
         property_response = self.client.post(
             "/api/property-record",
