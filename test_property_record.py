@@ -104,9 +104,9 @@ def build_garden_zones():
     return [build_garden_zone(1), build_garden_zone(2)]
 
 
-def build_property_context():
-    return {
-        "context_version": "property-context-v2",
+def build_property_context(include_roof_capacity=False):
+    context = {
+        "context_version": "property-context-v3",
         "match_envelope": {
             "bounds": {
                 "south": 30.2668,
@@ -118,6 +118,41 @@ def build_property_context():
             "height_m": 64.1,
             "source": "geocoder-match-envelope",
             "label": "Geocoder match envelope",
+        },
+        "parcel_context": {
+            "source": "geocoder-match-envelope",
+            "label": "Planning core",
+            "bounds": {
+                "south": 30.2668,
+                "north": 30.2676,
+                "west": -97.7437,
+                "east": -97.7426,
+            },
+            "gross_area_sq_m": 5397.2,
+            "gross_area_sq_ft": 58101.0,
+            "shape_class": "compact",
+            "edge_buffer_m": 5.1,
+            "planning_core_bounds": {
+                "south": 30.266846,
+                "north": 30.267554,
+                "west": -97.743647,
+                "east": -97.742653,
+            },
+            "planning_core_area_sq_m": 4260.4,
+            "planning_core_area_sq_ft": 45859.0,
+            "planning_core_share": 0.79,
+            "estimated_plantable_share": 0.61,
+            "estimated_plantable_area_sq_m": 3292.4,
+            "estimated_plantable_area_sq_ft": 35439.0,
+            "terrain_limit": "moderate",
+            "open_side": "east",
+            "directional_open_score": {
+                "north": 1.23,
+                "south": 0.84,
+                "east": 1.48,
+                "west": 0.92,
+            },
+            "summary": "Planning envelope covers about 58101 sq ft. An inset planning core keeps about 45859 sq ft away from edge effects, with the most open side looking east and moderate terrain constraint.",
         },
         "building_context": {
             "source": "openstreetmap-overpass",
@@ -203,9 +238,53 @@ def build_property_context():
             "terrain_bias": "more solar-favored",
             "summary": "Building, vegetation, and terrain cues read as moderate obstruction risk.",
         },
-        "summary": "2 nearby building footprints and 3 canopy features found. Local terrain reads as rolling with a south-facing bias.",
-        "model_note": "Buildings, mapped vegetation, and terrain context only.",
+        "summary": "2 nearby building footprints and 3 canopy features found. Local terrain reads as rolling with a south-facing bias. Planning envelope covers about 58101 sq ft. An inset planning core keeps about 45859 sq ft away from edge effects, with the most open side looking east and moderate terrain constraint. Building, vegetation, and terrain cues read as moderate obstruction risk.",
+        "model_note": "Buildings, mapped vegetation, terrain context, and an inset planning core only.",
     }
+    context["roof_capacity_context"] = (
+        {
+            "available": True,
+            "candidate_building_id": "osm-way-1",
+            "candidate_building_name": "Nearby building",
+            "candidate_building_kind": "office",
+            "candidate_building_distance_m": 18.4,
+            "centroid_within_match_envelope": True,
+            "gross_footprint_area_square_meters": 74.3,
+            "gross_footprint_area_square_feet": 799.8,
+            "usable_roof_area_square_meters": 42.0,
+            "usable_roof_area_square_feet": 452.1,
+            "recommended_system_size_kw": 8.4,
+            "dominant_edge_bearing": 90.0,
+            "dominant_edge_length_m": 14.1,
+            "confidence": "high",
+            "summary": "Matched building footprint suggests about 800 sq ft of gross roof area, roughly 452 sq ft of usable solar area, and about 8.4 kW of baseline capacity.",
+            "model_note": "Roof-capacity inference is conservative and uses the matched building footprint.",
+        }
+        if include_roof_capacity
+        else {
+            "available": False,
+            "candidate_building_id": None,
+            "candidate_building_name": None,
+            "candidate_building_kind": None,
+            "candidate_building_distance_m": None,
+            "centroid_within_match_envelope": False,
+            "gross_footprint_area_square_meters": None,
+            "gross_footprint_area_square_feet": None,
+            "usable_roof_area_square_meters": None,
+            "usable_roof_area_square_feet": None,
+            "recommended_system_size_kw": None,
+            "dominant_edge_bearing": None,
+            "dominant_edge_length_m": None,
+            "confidence": "low",
+            "summary": "No confident primary building footprint was available to infer parcel roof capacity.",
+            "model_note": "Roof-capacity inference is only emitted when a nearby primary building footprint looks confident enough to stand in for the main roof.",
+        }
+    )
+    if include_roof_capacity:
+        context["summary"] = (
+            f"{context['summary']} {context['roof_capacity_context']['summary']}"
+        )
+    return context
 
 
 def build_west_facing_property_context():
@@ -213,7 +292,8 @@ def build_west_facing_property_context():
     context["terrain_context"]["dominant_aspect"] = "west-facing"
     context["terrain_context"]["summary"] = "Local terrain reads as rolling with a west-facing bias."
     context["shade_context"]["terrain_bias"] = "mostly neutral"
-    context["summary"] = "2 nearby building footprints and 3 canopy features found. Local terrain reads as rolling with a west-facing bias."
+    context["parcel_context"]["open_side"] = "west"
+    context["summary"] = "2 nearby building footprints and 3 canopy features found. Local terrain reads as rolling with a west-facing bias. Planning envelope covers about 58101 sq ft. An inset planning core keeps about 45859 sq ft away from edge effects, with the most open side looking west and moderate terrain constraint. Building, vegetation, and terrain cues read as moderate obstruction risk."
     return context
 
 
@@ -410,9 +490,10 @@ class PropertyRecordTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["property_context"]["context_version"], "property-context-v2")
+        self.assertEqual(payload["property_context"]["context_version"], "property-context-v3")
         self.assertEqual(payload["property_context"]["building_context"]["obstruction_risk"], "moderate")
         self.assertEqual(payload["property_context"]["canopy_context"]["canopy_count"], 3)
+        self.assertEqual(payload["property_context"]["parcel_context"]["open_side"], "east")
 
         record = data_persistence.get_property_record(payload["guid"])
         self.assertEqual(record["property_context"]["terrain_context"]["terrain_class"], "rolling")
@@ -749,6 +830,58 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertTrue(
             any(
                 "address-only kw input" in factor.lower()
+                for factor in payload["confidence"]["factors"]
+            )
+        )
+
+    def test_solar_potential_uses_matched_building_footprint_without_roof_selection(self):
+        property_response = self.client.post(
+            "/api/property-record",
+            json={
+                "address": build_address(),
+                "property_preview": build_property_preview(),
+                "property_context": build_property_context(include_roof_capacity=True),
+            },
+        )
+        guid = property_response.json()["guid"]
+
+        with patch.object(main, "get_nrel_api_key", return_value=None):
+            with patch.object(main, "check_existing_zip_data", return_value=(None, None)):
+                with patch.object(main, "geocode_address", return_value=(30.2672, -97.7431)):
+                    with patch.object(main, "get_nasa_power_data", return_value=build_solar_data()):
+                        with patch.object(main, "get_timezone", return_value="America/Chicago"):
+                            response = self.client.post(
+                                "/api/solar-potential",
+                                json={
+                                    "guid": guid,
+                                    "system_size": 7.2,
+                                    "panel_efficiency": 0.2,
+                                    "electricity_rate": 0.16,
+                                    "installation_cost_per_watt": 3.0,
+                                },
+                            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["sizing_source"], "roof-footprint")
+        self.assertEqual(payload["estimate_mode"], "parcel-roof-estimate")
+        self.assertEqual(payload["system_size_kw"], 8.4)
+        self.assertAlmostEqual(payload["roof_area_square_feet"], 452.1, places=1)
+        self.assertIn("Parcel roof estimate", payload["sizing_note"])
+        self.assertIn("matched-footprint estimate", payload["next_input_needed"])
+        self.assertEqual(payload["production_model"]["id"], "parcel-roof-monthly-v1")
+        self.assertEqual(payload["production_model"]["assumed_azimuth"], 180.0)
+        self.assertTrue(payload["production_model"]["roof_capacity_available"])
+        self.assertAlmostEqual(
+            payload["production_model"]["estimated_roof_area_square_feet"],
+            452.1,
+            places=1,
+        )
+        self.assertTrue(payload["roof_capacity_context"]["available"])
+        self.assertLessEqual(payload["confidence"]["score"], 84)
+        self.assertTrue(
+            any(
+                "matched building footprint" in factor.lower()
                 for factor in payload["confidence"]["factors"]
             )
         )
@@ -1140,9 +1273,10 @@ class PropertyRecordTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["context_version"], "property-context-v2")
+        self.assertEqual(payload["context_version"], "property-context-v3")
         self.assertEqual(payload["building_context"]["building_count"], 2)
         self.assertEqual(payload["canopy_context"]["canopy_count"], 3)
+        self.assertEqual(payload["parcel_context"]["terrain_limit"], "moderate")
         mocked_snapshot.assert_called_once_with(
             30.2672,
             -97.7431,
@@ -1187,7 +1321,7 @@ class PropertyRecordTests(unittest.TestCase):
         mocked_snapshot.assert_called_once()
         self.assertEqual(
             mocked_snapshot.call_args.kwargs["property_context"]["context_version"],
-            "property-context-v2",
+            "property-context-v3",
         )
 
 

@@ -163,9 +163,13 @@ class PropertyContextRequest(BaseModel):
 class SpaceWeatherHistoryRequest(BaseModel):
     latitude: float
     longitude: float
+    time_zone: Optional[str] = None
     days: int = 7
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+    event_types: Optional[list[str]] = None
+    min_severity: str = "low"
+    limit: int = 100
     force_refresh: bool = False
 
 # Create a custom SSL context
@@ -1342,8 +1346,19 @@ def build_solar_modeling_context(latitude, roof_selection, property_context):
     building_context = (property_context or {}).get("building_context") or {}
     canopy_context = (property_context or {}).get("canopy_context") or {}
     shade_context = (property_context or {}).get("shade_context") or {}
+    roof_capacity_context = (property_context or {}).get("roof_capacity_context") or {}
     terrain_aspect = terrain_context.get("dominant_aspect")
     preferred_azimuth = aspect_to_azimuth(terrain_aspect) or 180.0
+
+    if (
+        not dominant_edge
+        and roof_capacity_context.get("available")
+        and roof_capacity_context.get("dominant_edge_bearing") is not None
+    ):
+        dominant_edge = {
+            "bearing": float(roof_capacity_context.get("dominant_edge_bearing")),
+            "length_m": float(roof_capacity_context.get("dominant_edge_length_m") or 0),
+        }
 
     if dominant_edge:
         candidate_a = normalize_azimuth(dominant_edge["bearing"] + 90)
@@ -1356,8 +1371,10 @@ def build_solar_modeling_context(latitude, roof_selection, property_context):
         )
         azimuth_source = (
             "roof polygon dominant edge with terrain-aware side selection"
-            if property_context
+            if roof_selection and property_context
             else "roof polygon dominant edge with solar-facing side selection"
+            if roof_selection
+            else "matched building footprint dominant edge with terrain-aware side selection"
         )
     else:
         assumed_azimuth = preferred_azimuth
@@ -1437,6 +1454,10 @@ def build_solar_modeling_context(latitude, roof_selection, property_context):
         "terrain_bias": terrain_bias,
         "building_pressure_score": round(weighted_building_pressure, 2),
         "canopy_pressure_score": round(weighted_canopy_pressure, 2),
+        "roof_capacity_available": bool(roof_capacity_context.get("available")),
+        "roof_capacity_confidence": roof_capacity_context.get("confidence"),
+        "estimated_roof_area_square_feet": roof_capacity_context.get("usable_roof_area_square_feet"),
+        "estimated_roof_area_square_meters": roof_capacity_context.get("usable_roof_area_square_meters"),
         "modeled_site_losses_percent": round(site_loss_fraction * 100, 1),
         "site_loss_factor": round(1 - site_loss_fraction, 3),
         "pvwatts_losses_percent": round(NREL_PVWATTS_DEFAULT_LOSSES + (site_loss_fraction * 100), 1),
@@ -1464,6 +1485,26 @@ def calculate_roof_backed_system_size(roof_selection, panel_efficiency):
     return round(float(recommended_kw), 2)
 
 
+def calculate_roof_capacity_backed_system_size(property_context, panel_efficiency):
+    roof_capacity_context = (property_context or {}).get("roof_capacity_context") or {}
+    if not roof_capacity_context.get("available"):
+        return None
+
+    usable_roof_area_square_meters = float(
+        roof_capacity_context.get("usable_roof_area_square_meters") or 0
+    )
+    if usable_roof_area_square_meters > 0:
+        normalized_efficiency = normalize_panel_efficiency(panel_efficiency)
+        kw = usable_roof_area_square_meters * normalized_efficiency
+        return round(clamp(kw, 1.5, 18.0), 2)
+
+    recommended_kw = roof_capacity_context.get("recommended_system_size_kw")
+    if recommended_kw is None:
+        return None
+
+    return round(float(recommended_kw), 2)
+
+
 def resolve_solar_sizing(input_data, roof_selection, property_context):
     roof_size_kw = calculate_roof_backed_system_size(
         roof_selection,
@@ -1476,6 +1517,33 @@ def resolve_solar_sizing(input_data, roof_selection, property_context):
             "estimate_mode": "roof-backed",
             "sizing_note": "System size is derived from the saved roof geometry and panel efficiency.",
             "next_input_needed": None,
+            "roof_area_square_feet": roof_selection.get("areaSquareFeet") if roof_selection else None,
+            "roof_area_square_meters": roof_selection.get("areaSquareMeters") if roof_selection else None,
+        }
+
+    roof_capacity_context = (property_context or {}).get("roof_capacity_context") or {}
+    roof_footprint_size_kw = calculate_roof_capacity_backed_system_size(
+        property_context,
+        input_data.panel_efficiency,
+    )
+    if roof_footprint_size_kw:
+        usable_roof_area_square_feet = float(
+            roof_capacity_context.get("usable_roof_area_square_feet") or 0
+        )
+        return {
+            "system_size_kw": roof_footprint_size_kw,
+            "sizing_source": "roof-footprint",
+            "estimate_mode": "parcel-roof-estimate",
+            "sizing_note": (
+                f"Parcel roof estimate uses a matched building footprint with about "
+                f"{round(usable_roof_area_square_feet):,} sq ft of inferred usable roof area and "
+                "the current panel-efficiency setting."
+            ),
+            "next_input_needed": (
+                "Draw the usable roof area to replace the matched-footprint estimate with roof-backed geometry."
+            ),
+            "roof_area_square_feet": roof_capacity_context.get("usable_roof_area_square_feet"),
+            "roof_area_square_meters": roof_capacity_context.get("usable_roof_area_square_meters"),
         }
 
     manual_size_kw = input_data.system_size
@@ -1501,6 +1569,8 @@ def resolve_solar_sizing(input_data, roof_selection, property_context):
             "next_input_needed": (
                 "Draw the usable roof area to replace address-only sizing with roof-backed capacity."
             ),
+            "roof_area_square_feet": None,
+            "roof_area_square_meters": None,
         }
 
     return {
@@ -1514,6 +1584,8 @@ def resolve_solar_sizing(input_data, roof_selection, property_context):
         "next_input_needed": (
             "Locate the property context and draw the usable roof area to improve this estimate."
         ),
+        "roof_area_square_feet": None,
+        "roof_area_square_meters": None,
     }
 
 
@@ -1541,6 +1613,8 @@ def build_solar_production_model(
     estimate_mode = (
         "roof-backed"
         if sizing_source == "roof-geometry"
+        else "parcel-roof-estimate"
+        if sizing_source == "roof-footprint"
         else "address-context"
         if sizing_source == "address-context"
         else "manual-screening"
@@ -1548,6 +1622,8 @@ def build_solar_production_model(
     model_id = (
         "roof-backed-monthly-v2"
         if sizing_source == "roof-geometry"
+        else "parcel-roof-monthly-v1"
+        if sizing_source == "roof-footprint"
         else "address-context-monthly-v1"
         if sizing_source == "address-context"
         else "manual-screening-monthly-v1"
@@ -1555,6 +1631,8 @@ def build_solar_production_model(
     model_label = (
         "Roof-backed monthly model"
         if sizing_source == "roof-geometry"
+        else "Parcel roof monthly model"
+        if sizing_source == "roof-footprint"
         else "Address-context monthly model"
         if sizing_source == "address-context"
         else "Manual screening monthly model"
@@ -1566,6 +1644,11 @@ def build_solar_production_model(
             "screening multiplier."
         )
         if sizing_source == "roof-geometry"
+        else (
+            "Uses month-by-month solar resource data, a matched building footprint to infer usable "
+            "roof capacity, footprint-derived roof-facing assumptions, and first-pass site-context losses."
+        )
+        if sizing_source == "roof-footprint"
         else (
             "Uses month-by-month solar resource data, address-level orientation and site-context "
             "assumptions, and the current system-size input until a roof polygon is drawn."
@@ -1582,7 +1665,7 @@ def build_solar_production_model(
         "soiling": 0.97,
         "availability": 0.99,
         "temperature": resolve_temperature_factor(avg_all_sky_radiation),
-        "layout": 0.96 if roof_selection else 0.90,
+        "layout": 0.96 if roof_selection else 0.93 if sizing_source == "roof-footprint" else 0.90,
         "site_context": modeling_context.get("site_loss_factor", 1.0),
     }
 
@@ -1640,6 +1723,10 @@ def build_solar_production_model(
         "terrain_bias": modeling_context.get("terrain_bias"),
         "building_pressure_score": modeling_context.get("building_pressure_score"),
         "canopy_pressure_score": modeling_context.get("canopy_pressure_score"),
+        "roof_capacity_available": modeling_context.get("roof_capacity_available", False),
+        "roof_capacity_confidence": modeling_context.get("roof_capacity_confidence"),
+        "estimated_roof_area_square_feet": modeling_context.get("estimated_roof_area_square_feet"),
+        "estimated_roof_area_square_meters": modeling_context.get("estimated_roof_area_square_meters"),
         "modeled_site_losses_percent": modeling_context.get("modeled_site_losses_percent"),
         "dominant_edge_bearing": modeling_context.get("dominant_edge_bearing"),
         "dominant_edge_length_m": modeling_context.get("dominant_edge_length_m"),
@@ -1692,6 +1779,8 @@ def build_nrel_pvwatts_production_model(
     estimate_mode = (
         "roof-backed"
         if sizing_source == "roof-geometry"
+        else "parcel-roof-estimate"
+        if sizing_source == "roof-footprint"
         else "address-context"
         if sizing_source == "address-context"
         else "manual-screening"
@@ -1702,6 +1791,11 @@ def build_nrel_pvwatts_production_model(
             "selection, a terrain-informed tilt fallback, and first-pass site-context losses."
         )
         if sizing_source == "roof-geometry"
+        else (
+            "Uses NREL PVWatts V8 with NSRDB weather data, a matched building footprint to infer "
+            "usable roof capacity, footprint-derived azimuth inputs, and first-pass site-context losses."
+        )
+        if sizing_source == "roof-footprint"
         else (
             "Uses NREL PVWatts V8 with NSRDB weather data, address-level orientation and "
             "site-context assumptions, and the current system-size input until a roof polygon is drawn."
@@ -1742,6 +1836,10 @@ def build_nrel_pvwatts_production_model(
         "terrain_bias": modeling_context.get("terrain_bias"),
         "building_pressure_score": modeling_context.get("building_pressure_score"),
         "canopy_pressure_score": modeling_context.get("canopy_pressure_score"),
+        "roof_capacity_available": modeling_context.get("roof_capacity_available", False),
+        "roof_capacity_confidence": modeling_context.get("roof_capacity_confidence"),
+        "estimated_roof_area_square_feet": modeling_context.get("estimated_roof_area_square_feet"),
+        "estimated_roof_area_square_meters": modeling_context.get("estimated_roof_area_square_meters"),
         "modeled_site_losses_percent": round(float(losses or 0) - NREL_PVWATTS_DEFAULT_LOSSES, 1),
         "dominant_edge_bearing": modeling_context.get("dominant_edge_bearing"),
         "dominant_edge_length_m": modeling_context.get("dominant_edge_length_m"),
@@ -1786,6 +1884,16 @@ def build_solar_assumptions(
             f"{round(float(roof_selection.get('areaSquareFeet', 0))):,} sq ft, "
             f"{normalized_efficiency * 100:.0f}% panel efficiency, and a "
             f"{ROOF_COVERAGE_FACTOR * 100:.0f}% roof coverage allowance."
+        )
+    elif sizing_source == "roof-footprint":
+        inferred_roof_area_square_feet = float(
+            production_model.get("estimated_roof_area_square_feet") or 0
+        )
+        system_size_assumption = (
+            f"{sizing_note} That footprint-derived capacity uses about "
+            f"{round(inferred_roof_area_square_feet):,} sq ft of inferred usable roof area, "
+            f"{normalized_efficiency * 100:.0f}% panel efficiency, and a "
+            f"{ROOF_COVERAGE_FACTOR * 100:.0f}% usable-roof allowance."
         )
     elif sizing_source == "address-context":
         system_size_assumption = (
@@ -1854,6 +1962,9 @@ def build_solar_confidence(
     if sizing_source == "roof-geometry" and roof_selection:
         score += 22
         factors.append("System size is derived from the saved roof geometry and panel efficiency.")
+    elif sizing_source == "roof-footprint":
+        score += 18
+        factors.append("System size is derived from a matched building footprint and assumed usable roof coverage.")
     elif sizing_source == "address-context":
         score += 14
         factors.append("System size uses the current address-only kW input until roof geometry is drawn.")
@@ -1868,6 +1979,8 @@ def build_solar_confidence(
             score += 6
             if sizing_source == "roof-geometry":
                 factors.append("Roof-facing inputs and site losses are refined from the drawn roof and saved property context.")
+            elif sizing_source == "roof-footprint":
+                factors.append("Matched building footprint, terrain, and site context refine orientation and site-loss inputs.")
             else:
                 factors.append("Address-level terrain and site context refine orientation and site-loss inputs.")
         else:
@@ -1881,6 +1994,8 @@ def build_solar_confidence(
             score += 5
             if sizing_source == "roof-geometry":
                 factors.append("Nearby building, vegetation, and terrain context temper the production model for this property.")
+            elif sizing_source == "roof-footprint":
+                factors.append("Matched building footprint plus nearby building, vegetation, and terrain context temper the production model.")
             else:
                 factors.append("Address-level building, vegetation, and terrain context temper the production model.")
 
@@ -1919,10 +2034,20 @@ def build_solar_confidence(
     if roof_area_square_feet and roof_area_square_feet < 350:
         score -= 4
         factors.append("The selected roof area is small, so the estimate is more sensitive to drawing changes.")
+    elif sizing_source == "roof-footprint":
+        estimated_roof_area_square_feet = float(
+            production_model.get("estimated_roof_area_square_feet") or 0
+        )
+        if estimated_roof_area_square_feet and estimated_roof_area_square_feet < 350:
+            score -= 3
+            factors.append("The inferred usable roof area is small, so the estimate is more sensitive to roof-shape assumptions.")
 
     if sizing_source == "address-context":
         score = min(score, 78)
         factors.append("Drawing the roof area is the next step to graduate this from address-context to roof-backed sizing.")
+    elif sizing_source == "roof-footprint":
+        score = min(score, 84)
+        factors.append("Drawing the roof area is the next step to replace the matched-footprint estimate with roof-backed sizing.")
     elif sizing_source != "roof-geometry":
         score = min(score, 68)
 
@@ -1988,6 +2113,7 @@ def build_saved_solar_report(address, estimate, report_name=None):
         "utility_context": estimate.get("utility_context"),
         "roof_area_square_feet": estimate["roof_area_square_feet"],
         "roof_area_square_meters": estimate["roof_area_square_meters"],
+        "roof_capacity_context": estimate.get("roof_capacity_context"),
         "production_model": estimate["production_model"],
         "monthly_production": estimate["monthly_production"],
         "monthly_savings": estimate["monthly_savings"],
@@ -2011,7 +2137,8 @@ def build_homeowner_quote(address, report, existing_quote=None):
     annual_savings = round(float(report.get("annual_savings") or 0))
     annual_production = round(float(report.get("annual_production") or 0))
     confidence_label = (report.get("confidence") or {}).get("label") or "Planning"
-    has_roof_geometry = report.get("sizing_source") == "roof-geometry"
+    sizing_source = report.get("sizing_source")
+    has_roof_geometry = sizing_source == "roof-geometry"
 
     return {
         "id": quote_id,
@@ -2029,6 +2156,8 @@ def build_homeowner_quote(address, report, existing_quote=None):
         "disclaimer": (
             "This is a shareable planning quote based on saved roof geometry and current model assumptions. "
             if has_roof_geometry
+            else "This is a shareable planning quote based on a matched building footprint and current model assumptions. "
+            if sizing_source == "roof-footprint"
             else "This is a shareable planning quote based on address-level context and current model assumptions. "
         ) + (
             "Final pricing, layout, and installer scope still require site review."
@@ -2197,6 +2326,8 @@ def build_solar_estimate_response(input_data):
     estimate_mode = sizing_context["estimate_mode"]
     sizing_note = sizing_context["sizing_note"]
     next_input_needed = sizing_context["next_input_needed"]
+    roof_area_square_feet = sizing_context["roof_area_square_feet"]
+    roof_area_square_meters = sizing_context["roof_area_square_meters"]
 
     solar_data, time_zone = check_existing_solar_data(guid)
     data_source = "guid-cache" if solar_data else None
@@ -2414,8 +2545,9 @@ def build_solar_estimate_response(input_data):
         "electricity_rate_used": effective_electricity_rate,
         "rate_assumption_source": rate_assumption_source,
         "utility_context": utility_context,
-        "roof_area_square_feet": roof_selection.get("areaSquareFeet") if roof_selection else None,
-        "roof_area_square_meters": roof_selection.get("areaSquareMeters") if roof_selection else None,
+        "roof_area_square_feet": roof_area_square_feet,
+        "roof_area_square_meters": roof_area_square_meters,
+        "roof_capacity_context": (property_context or {}).get("roof_capacity_context"),
         "assumptions": assumptions,
         "confidence": confidence,
         "production_model": production_model,
@@ -2630,7 +2762,7 @@ def get_space_weather(coordinates: Coordinates):
     description="Returns recent NASA DONKI flare and geomagnetic-storm history localized to the provided coordinates.",
 )
 def get_space_weather_history_endpoint(payload: SpaceWeatherHistoryRequest):
-    time_zone = get_timezone(payload.latitude, payload.longitude) or "UTC"
+    time_zone = payload.time_zone or get_timezone(payload.latitude, payload.longitude) or "UTC"
     try:
         return get_space_weather_history(
             payload.latitude,
@@ -2639,6 +2771,9 @@ def get_space_weather_history_endpoint(payload: SpaceWeatherHistoryRequest):
             days=payload.days,
             start_date=payload.start_date,
             end_date=payload.end_date,
+            event_types=payload.event_types,
+            min_severity=payload.min_severity,
+            limit=payload.limit,
             force_refresh=payload.force_refresh,
         )
     except requests.HTTPError as exc:

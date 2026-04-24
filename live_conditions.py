@@ -1436,19 +1436,30 @@ def _normalize_history_window(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ):
-    default_window = max(1, min(int(days or 7), 90))
+    try:
+        default_window = int(days or 7)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("days must be an integer between 1 and 90") from exc
+    if default_window < 1 or default_window > 90:
+        raise ValueError("days must be between 1 and 90")
     today = datetime.now(timezone.utc).date()
     parsed_start = None
     parsed_end = None
 
     if start_date:
-        parsed_start = date.fromisoformat(start_date)
+        try:
+            parsed_start = date.fromisoformat(start_date)
+        except ValueError as exc:
+            raise ValueError("start_date must be in YYYY-MM-DD format") from exc
     if end_date:
-        parsed_end = date.fromisoformat(end_date)
+        try:
+            parsed_end = date.fromisoformat(end_date)
+        except ValueError as exc:
+            raise ValueError("end_date must be in YYYY-MM-DD format") from exc
 
     if parsed_start and parsed_end:
         if parsed_start > parsed_end:
-            parsed_start, parsed_end = parsed_end, parsed_start
+            raise ValueError("start_date must be on or before end_date")
     elif parsed_start:
         parsed_end = min(today, parsed_start + timedelta(days=default_window - 1))
     elif parsed_end:
@@ -1461,9 +1472,11 @@ def _normalize_history_window(
     if parsed_end > today:
         parsed_end = today
     if parsed_start > parsed_end:
-        parsed_start = parsed_end
+        raise ValueError("start_date must be on or before end_date")
 
     actual_days = max((parsed_end - parsed_start).days + 1, 1)
+    if actual_days > 90:
+        raise ValueError("history window cannot exceed 90 days")
     return parsed_start, parsed_end, actual_days
 
 
@@ -1532,6 +1545,77 @@ def _flare_local_relevance(class_type: Optional[str], *, is_daylight: bool):
     }
 
 
+def _normalize_history_event_types(event_types: Optional[Any]) -> list[str]:
+    if event_types is None:
+        return ["flare", "geomagnetic_storm"]
+    if isinstance(event_types, str):
+        raw_values = [event_types]
+    else:
+        raw_values = list(event_types or [])
+    if not raw_values:
+        return ["flare", "geomagnetic_storm"]
+
+    aliases = {
+        "flare": "flare",
+        "solar_flare": "flare",
+        "geomagnetic_storm": "geomagnetic_storm",
+        "geomagnetic_storms": "geomagnetic_storm",
+        "geomagnetic-storm": "geomagnetic_storm",
+        "geomagnetic storm": "geomagnetic_storm",
+        "storm": "geomagnetic_storm",
+    }
+    normalized_values: list[str] = []
+    for raw_value in raw_values:
+        key = str(raw_value or "").strip().lower().replace("-", "_")
+        if key not in aliases:
+            raise ValueError("event_types must only include flare or geomagnetic_storm")
+        normalized = aliases[key]
+        if normalized not in normalized_values:
+            normalized_values.append(normalized)
+    return normalized_values or ["flare", "geomagnetic_storm"]
+
+
+def _normalize_history_min_severity(value: Optional[str]) -> str:
+    normalized = str(value or "low").strip().lower()
+    aliases = {
+        "low": "low",
+        "moderate": "moderate",
+        "medium": "moderate",
+        "high": "high",
+        "extreme": "extreme",
+    }
+    if normalized not in aliases:
+        raise ValueError("min_severity must be low, moderate, high, or extreme")
+    return aliases[normalized]
+
+
+def _history_severity_rank(value: Optional[str]) -> int:
+    return {
+        "low": 0,
+        "moderate": 1,
+        "high": 2,
+        "extreme": 3,
+    }.get(str(value or "low").strip().lower(), 0)
+
+
+def _normalize_flare_severity(class_type: Optional[str]) -> str:
+    normalized = str(class_type or "").strip().upper()
+    if not normalized:
+        return "low"
+
+    band = normalized[:1]
+    magnitude = _safe_float(normalized[1:], 0.0)
+    if band in {"A", "B"}:
+        return "low"
+    if band == "C":
+        return "moderate" if magnitude >= 5 else "low"
+    if band == "M":
+        return "high" if magnitude >= 5 else "moderate"
+    if band == "X":
+        return "extreme" if magnitude >= 10 else "high"
+    return "low"
+
+
 def _storm_tone(max_kp_index: float) -> str:
     if max_kp_index >= 7:
         return "alert"
@@ -1585,9 +1669,53 @@ def _storm_local_relevance(max_kp_index: float, latitude_band: str):
     }
 
 
+def _normalize_storm_severity(max_kp_index: float) -> str:
+    if max_kp_index >= 8:
+        return "extreme"
+    if max_kp_index >= 6:
+        return "high"
+    if max_kp_index >= 5:
+        return "moderate"
+    return "low"
+
+
+def _normalize_history_limit(limit: Optional[int]) -> int:
+    try:
+        normalized_limit = int(limit or 100)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer between 1 and 200") from exc
+    if normalized_limit < 1 or normalized_limit > 200:
+        raise ValueError("limit must be between 1 and 200")
+    return normalized_limit
+
+
 def format_label(value: Optional[str]):
     normalized = str(value or "unknown").replace("_", " ").replace("-", " ").strip()
     return normalized.capitalize() if normalized else "Unknown"
+
+
+def _storm_aurora_potential(max_kp_index: float, latitude_band: str, is_daylight: bool) -> str:
+    if is_daylight:
+        return "low"
+    if max_kp_index >= 7 and latitude_band in {"high", "mid"}:
+        return "likely"
+    if max_kp_index >= 5 and latitude_band in {"high", "mid"}:
+        return "possible"
+    if max_kp_index >= 7 and latitude_band == "low":
+        return "possible"
+    return "low"
+
+
+def _build_history_event_id(
+    prefix: str,
+    observed_at: Optional[str],
+    source_id: Optional[str],
+    fallback: Optional[str],
+) -> str:
+    suffix = str(source_id or fallback or "event").strip().lower()
+    safe_suffix = "".join(character if character.isalnum() else "-" for character in suffix).strip("-")
+    safe_suffix = safe_suffix or "event"
+    return f"{prefix}-{observed_at or 'unknown'}-{safe_suffix}"
 
 
 def _build_space_weather_history_summary(
@@ -2531,6 +2659,9 @@ def get_space_weather_history(
     days: int = 7,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    event_types: Optional[Any] = None,
+    min_severity: str = "low",
+    limit: int = 100,
     force_refresh: bool = False,
 ):
     start_day, end_day, actual_days = _normalize_history_window(
@@ -2538,6 +2669,9 @@ def get_space_weather_history(
         start_date=start_date,
         end_date=end_date,
     )
+    normalized_event_types = _normalize_history_event_types(event_types)
+    normalized_min_severity = _normalize_history_min_severity(min_severity)
+    normalized_limit = _normalize_history_limit(limit)
     flares_response = _fetch_json(
         NASA_DONKI_FLR_URL,
         params={
@@ -2563,32 +2697,60 @@ def get_space_weather_history(
     flares_payload = flares_response.get("data") or []
     storms_payload = storms_response.get("data") or []
     latitude_band = _latitude_band(latitude)
-    events = []
+    events: list[dict[str, Any]] = []
 
     for flare in flares_payload if isinstance(flares_payload, list) else []:
         observed_at = flare.get("peakTime") or flare.get("beginTime")
         local_time = _localize_time(observed_at, time_zone_name)
+        is_daylight = bool(local_time and 6 <= local_time.hour < 18)
+        severity = _normalize_flare_severity(flare.get("classType"))
         local_relevance = _flare_local_relevance(
             flare.get("classType"),
-            is_daylight=bool(local_time and 6 <= local_time.hour < 18),
+            is_daylight=is_daylight,
         )
+        source_id = flare.get("flrID") or flare.get("activityID")
         events.append(
             {
-                "id": f"flare-{observed_at or len(events)}",
-                "kind": "flare",
-                "label": flare.get("classType") or "Solar flare",
+                "id": _build_history_event_id(
+                    "flare",
+                    observed_at,
+                    source_id,
+                    flare.get("classType") or flare.get("sourceLocation"),
+                ),
+                "event_type": "flare",
+                "severity": severity,
                 "tone": _flare_tone(flare.get("classType")),
                 "observed_at": observed_at,
+                "title": f"{flare.get('classType') or 'Unclassified'} flare",
+                "source": "nasa-donki-flares",
+                "source_id": source_id,
+                "global_severity": {
+                    "class": flare.get("classType"),
+                    "severity": severity,
+                },
+                "local_relevance": local_relevance["tone"],
+                "relevance_reason": local_relevance["detail"],
+                "location_context": {
+                    "local_event_time": local_time.isoformat() if local_time else None,
+                    "is_daylight": is_daylight if local_time else None,
+                    "latitude_band": latitude_band,
+                    "primary_effect": "hf_radio" if is_daylight else "muted",
+                },
+                "metadata": {
+                    "class_type": flare.get("classType"),
+                    "source_location": flare.get("sourceLocation"),
+                    "begin_time": flare.get("beginTime"),
+                    "peak_time": flare.get("peakTime"),
+                    "link": flare.get("link"),
+                },
+                "kind": "flare",
+                "label": flare.get("classType") or "Solar flare",
                 "local_time": local_time.isoformat() if local_time else None,
                 "detail": (
                     f"{flare.get('classType') or 'Unclassified'} flare from "
                     f"{flare.get('sourceLocation') or 'an unspecified source region'}."
                 ),
                 "source_location": flare.get("sourceLocation"),
-                "global_severity": {
-                    "class": flare.get("classType"),
-                },
-                "local_relevance": local_relevance,
             }
         )
 
@@ -2603,37 +2765,73 @@ def get_space_weather_history(
 
         observed_at = peak_time or storm.get("startTime")
         local_time = _localize_time(observed_at, time_zone_name)
+        is_daylight = bool(local_time and 6 <= local_time.hour < 18)
+        severity = _normalize_storm_severity(kp_index)
         local_relevance = _storm_local_relevance(kp_index, latitude_band)
+        source_id = storm.get("gstID") or storm.get("activityID")
         events.append(
             {
-                "id": f"storm-{observed_at or len(events)}",
-                "kind": "geomagnetic-storm",
-                "label": f"Kp {kp_index:.1f}" if kp_index else "Geomagnetic storm",
+                "id": _build_history_event_id(
+                    "storm",
+                    observed_at,
+                    source_id,
+                    f"kp-{kp_index:.1f}",
+                ),
+                "event_type": "geomagnetic_storm",
+                "severity": severity,
                 "tone": _storm_tone(kp_index),
                 "observed_at": observed_at,
+                "title": f"Kp {kp_index:.1f} geomagnetic storm" if kp_index else "Geomagnetic storm",
+                "source": "nasa-donki-geomagnetic-storms",
+                "source_id": source_id,
+                "global_severity": {
+                    "max_kp_index": round(kp_index, 2),
+                    "start_time": storm.get("startTime"),
+                    "severity": severity,
+                },
+                "local_relevance": local_relevance["tone"],
+                "relevance_reason": local_relevance["detail"],
+                "location_context": {
+                    "local_event_time": local_time.isoformat() if local_time else None,
+                    "is_daylight": is_daylight if local_time else None,
+                    "latitude_band": latitude_band,
+                    "primary_effect": "aurora_gnss" if local_relevance["tone"] in {"watch", "alert"} else "geomagnetic_background",
+                    "aurora_potential": _storm_aurora_potential(kp_index, latitude_band, is_daylight),
+                },
+                "metadata": {
+                    "start_time": storm.get("startTime"),
+                    "all_kp_index": storm.get("allKpIndex") or [],
+                    "link": storm.get("link"),
+                },
+                "kind": "geomagnetic-storm",
+                "label": f"Kp {kp_index:.1f}" if kp_index else "Geomagnetic storm",
                 "local_time": local_time.isoformat() if local_time else None,
                 "detail": (
                     f"Geomagnetic storm window with a reported peak near Kp {kp_index:.1f}."
                     if kp_index
                     else "Geomagnetic storm window reported by DONKI."
                 ),
-                "global_severity": {
-                    "max_kp_index": round(kp_index, 2),
-                    "start_time": storm.get("startTime"),
-                },
-                "local_relevance": local_relevance,
             }
         )
+
+    minimum_severity_rank = _history_severity_rank(normalized_min_severity)
+    events = [
+        event
+        for event in events
+        if event.get("event_type") in normalized_event_types
+        and _history_severity_rank(event.get("severity")) >= minimum_severity_rank
+    ]
 
     events.sort(
         key=lambda event: _parse_time(event.get("observed_at")) or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
+    events = events[:normalized_limit]
 
     strongest_flare_class = None
     strongest_flare_strength = 0.0
     for event in events:
-        if event.get("kind") != "flare":
+        if event.get("event_type") != "flare":
             continue
         class_type = (event.get("global_severity") or {}).get("class")
         strength = _flare_class_strength(class_type)
@@ -2643,24 +2841,44 @@ def get_space_weather_history(
 
     strongest_storm_kp = None
     for event in events:
-        if event.get("kind") != "geomagnetic-storm":
+        if event.get("event_type") != "geomagnetic_storm":
             continue
         max_kp_index = _safe_float((event.get("global_severity") or {}).get("max_kp_index"))
         if strongest_storm_kp is None or max_kp_index > strongest_storm_kp:
             strongest_storm_kp = max_kp_index
 
-    flare_count = sum(1 for event in events if event.get("kind") == "flare")
-    storm_count = sum(1 for event in events if event.get("kind") == "geomagnetic-storm")
+    flare_count = sum(1 for event in events if event.get("event_type") == "flare")
+    storm_count = sum(1 for event in events if event.get("event_type") == "geomagnetic_storm")
+    local_watch_count = sum(1 for event in events if event.get("local_relevance") == "watch")
+    local_alert_count = sum(1 for event in events if event.get("local_relevance") == "alert")
 
     return {
         "latitude": round(latitude, 6),
         "longitude": round(longitude, 6),
         "time_zone": time_zone_name or "UTC",
+        "window": {
+            "start_date": start_day.isoformat(),
+            "end_date": end_day.isoformat(),
+        },
         "start_date": start_day.isoformat(),
         "end_date": end_day.isoformat(),
         "days": actual_days,
         "latitude_band": latitude_band,
-        "summary": _build_space_weather_history_summary(
+        "applied_filters": {
+            "event_types": normalized_event_types,
+            "min_severity": normalized_min_severity,
+            "limit": normalized_limit,
+        },
+        "summary": {
+            "event_count": len(events),
+            "flare_count": flare_count,
+            "geomagnetic_storm_count": storm_count,
+            "local_watch_count": local_watch_count,
+            "local_alert_count": local_alert_count,
+            "strongest_flare_class": strongest_flare_class,
+            "strongest_geomagnetic_kp": round(strongest_storm_kp, 2) if strongest_storm_kp is not None else None,
+        },
+        "summary_text": _build_space_weather_history_summary(
             actual_days,
             flare_count,
             storm_count,
@@ -2672,6 +2890,8 @@ def get_space_weather_history(
             "flare_events": flare_count,
             "geomagnetic_storms": storm_count,
             "total_events": len(events),
+            "local_watch_events": local_watch_count,
+            "local_alert_events": local_alert_count,
         },
         "strongest": {
             "flare_class": strongest_flare_class,

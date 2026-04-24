@@ -78,6 +78,52 @@ def build_storms_payload():
     ]
 
 
+def build_history_flares_payload():
+    return [
+        {
+            "classType": "X1.2",
+            "peakTime": "2026-04-05T12:00Z",
+            "beginTime": "2026-04-05T11:48Z",
+            "sourceLocation": "N10W04",
+            "flrID": "flr-1",
+        },
+        {
+            "classType": "M6.1",
+            "peakTime": "2026-04-04T13:30Z",
+            "beginTime": "2026-04-04T13:12Z",
+            "sourceLocation": "S08E14",
+            "flrID": "flr-2",
+        },
+        {
+            "classType": "C3.2",
+            "peakTime": "2026-04-03T03:10Z",
+            "beginTime": "2026-04-03T02:55Z",
+            "sourceLocation": "N04W22",
+            "flrID": "flr-3",
+        },
+    ]
+
+
+def build_history_storms_payload():
+    return [
+        {
+            "startTime": "2026-04-05T10:00Z",
+            "gstID": "gst-1",
+            "allKpIndex": [
+                {"observedTime": "2026-04-05T12:00Z", "kpIndex": "5.67"},
+                {"observedTime": "2026-04-05T15:00Z", "kpIndex": "6.67"},
+            ],
+        },
+        {
+            "startTime": "2026-04-02T04:00Z",
+            "gstID": "gst-2",
+            "allKpIndex": [
+                {"observedTime": "2026-04-02T06:00Z", "kpIndex": "4.33"},
+            ],
+        },
+    ]
+
+
 def build_aurora_payload():
     return {
         "Observation Time": "2026-04-05T19:17:00Z",
@@ -240,7 +286,7 @@ class SpaceWeatherEndpointTests(unittest.TestCase):
     def tearDown(self):
         live_conditions._CACHE.clear()
 
-    def _fake_requests_get(self, aurora_status_code=200):
+    def _fake_requests_get(self, aurora_status_code=200, flares_payload=None, storms_payload=None):
         plasma_truncated = (
             '[["time_tag","density","speed","temperature"],'
             '["2026-04-05 14:03:00.000","0.52","535.9","117988"],'
@@ -259,8 +305,8 @@ class SpaceWeatherEndpointTests(unittest.TestCase):
                 json.dumps(build_aurora_payload()),
                 status_code=aurora_status_code,
             ),
-            live_conditions.NASA_DONKI_FLR_URL: FakeResponse(json.dumps(build_flares_payload())),
-            live_conditions.NASA_DONKI_GST_URL: FakeResponse(json.dumps(build_storms_payload())),
+            live_conditions.NASA_DONKI_FLR_URL: FakeResponse(json.dumps(flares_payload if flares_payload is not None else build_flares_payload())),
+            live_conditions.NASA_DONKI_GST_URL: FakeResponse(json.dumps(storms_payload if storms_payload is not None else build_storms_payload())),
         }
 
         def _dispatch(url, params=None, timeout=15):
@@ -334,13 +380,68 @@ class SpaceWeatherEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["days"], 7)
+        self.assertEqual(payload["window"]["start_date"], payload["start_date"])
         self.assertEqual(payload["counts"]["flare_events"], 1)
         self.assertEqual(payload["counts"]["geomagnetic_storms"], 1)
-        self.assertEqual(payload["strongest"]["flare_class"], "C4.5")
-        self.assertAlmostEqual(payload["strongest"]["geomagnetic_kp"], 5.33, places=2)
-        self.assertEqual(payload["events"][0]["kind"], "geomagnetic-storm")
+        self.assertEqual(payload["summary"]["strongest_flare_class"], "C4.5")
+        self.assertAlmostEqual(payload["summary"]["strongest_geomagnetic_kp"], 5.33, places=2)
+        self.assertEqual(payload["events"][0]["event_type"], "geomagnetic_storm")
+        self.assertIn(payload["events"][0]["severity"], {"moderate", "high", "extreme"})
+        self.assertIn("location_context", payload["events"][0])
         self.assertIn("nasa-donki-flares", payload["sources"])
         self.assertIn("nasa-donki-geomagnetic-storms", payload["sources"])
+
+    @patch.object(main, "get_timezone", return_value="America/Chicago")
+    def test_space_weather_history_endpoint_filters_by_event_type_severity_and_limit(self, _timezone):
+        with patch.object(
+            live_conditions.requests,
+            "get",
+            side_effect=self._fake_requests_get(
+                flares_payload=build_history_flares_payload(),
+                storms_payload=build_history_storms_payload(),
+            ),
+        ):
+            response = self.client.post(
+                "/api/space-weather/history",
+                json={
+                    "latitude": 30.2672,
+                    "longitude": -97.7431,
+                    "start_date": "2026-04-01",
+                    "end_date": "2026-04-05",
+                    "event_types": ["flare"],
+                    "min_severity": "high",
+                    "limit": 1,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["applied_filters"]["event_types"], ["flare"])
+        self.assertEqual(payload["applied_filters"]["min_severity"], "high")
+        self.assertEqual(payload["summary"]["event_count"], 1)
+        self.assertEqual(payload["counts"]["flare_events"], 1)
+        self.assertEqual(payload["counts"]["geomagnetic_storms"], 0)
+        self.assertEqual(len(payload["events"]), 1)
+        self.assertEqual(payload["events"][0]["event_type"], "flare")
+        self.assertEqual(payload["events"][0]["title"], "X1.2 flare")
+        self.assertEqual(payload["events"][0]["severity"], "high")
+        self.assertEqual(payload["events"][0]["local_relevance"], "alert")
+        self.assertTrue(payload["events"][0]["location_context"]["is_daylight"])
+
+    @patch.object(main, "get_timezone", return_value="America/Chicago")
+    def test_space_weather_history_endpoint_rejects_range_longer_than_ninety_days(self, _timezone):
+        response = self.client.post(
+            "/api/space-weather/history",
+            json={
+                "latitude": 30.2672,
+                "longitude": -97.7431,
+                "start_date": "2026-01-01",
+                "end_date": "2026-04-15",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("cannot exceed 90 days", response.json()["detail"])
 
 
 if __name__ == "__main__":

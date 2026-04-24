@@ -13,6 +13,9 @@ _CACHE: dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, Any]] = {}
 OVERPASS_INTERPRETER_URL = "https://overpass-api.de/api/interpreter"
 OPEN_TOPO_DATA_URL = "https://api.opentopodata.org/v1/srtm90m"
 EARTH_RADIUS_METERS = 6371000
+SQ_METERS_TO_SQ_FEET = 10.7639
+BASELINE_PANEL_EFFICIENCY = 0.20
+ROOF_COVERAGE_FACTOR = 0.565
 
 
 def _normalize_params(params: Optional[dict[str, Any]]) -> tuple[tuple[str, str], ...]:
@@ -182,6 +185,70 @@ def _build_point_geometry(point: Optional[dict[str, float]]):
     }
 
 
+def _point_within_bounds(point: Optional[dict[str, float]], bounds: Optional[dict[str, Any]]):
+    if not point or not bounds:
+        return False
+
+    return (
+        float(bounds.get("south") or -90) <= float(point.get("lat") or 0) <= float(bounds.get("north") or 90)
+        and float(bounds.get("west") or -180) <= float(point.get("lng") or 0) <= float(bounds.get("east") or 180)
+    )
+
+
+def _project_point_meters(reference_lat: float, reference_lng: float, point: dict[str, float]):
+    latitude_radians = math.radians(reference_lat)
+    x_value = math.radians(point["lng"] - reference_lng) * EARTH_RADIUS_METERS * math.cos(latitude_radians)
+    y_value = math.radians(point["lat"] - reference_lat) * EARTH_RADIUS_METERS
+    return x_value, y_value
+
+
+def _polygon_area_square_meters(points: list[dict[str, float]]):
+    if len(points) < 3:
+        return None
+
+    reference = _polygon_centroid(points)
+    if not reference:
+        return None
+
+    projected_points = [_project_point_meters(reference["lat"], reference["lng"], point) for point in points]
+    if projected_points[0] != projected_points[-1]:
+        projected_points.append(projected_points[0])
+
+    area = 0.0
+    for index in range(len(projected_points) - 1):
+        x_a, y_a = projected_points[index]
+        x_b, y_b = projected_points[index + 1]
+        area += (x_a * y_b) - (x_b * y_a)
+
+    return abs(area) / 2
+
+
+def _dominant_edge(points: list[dict[str, float]]):
+    if len(points) < 2:
+        return None
+
+    ring_points = points[:]
+    if ring_points[0] != ring_points[-1]:
+        ring_points.append(ring_points[0])
+
+    longest_edge = None
+    for index in range(len(ring_points) - 1):
+        start = ring_points[index]
+        end = ring_points[index + 1]
+        edge_length_m = _haversine_meters(start["lat"], start["lng"], end["lat"], end["lng"])
+        if edge_length_m < 2:
+            continue
+
+        edge = {
+            "bearing": _round(_bearing_degrees(start["lat"], start["lng"], end["lat"], end["lng"]), 1),
+            "length_m": _round(edge_length_m, 1),
+        }
+        if not longest_edge or edge["length_m"] > longest_edge["length_m"]:
+            longest_edge = edge
+
+    return longest_edge
+
+
 def _classify_pressure(score: float):
     if score >= 0.7:
         return "high"
@@ -275,11 +342,191 @@ def _build_context_envelope(latitude: float, longitude: float, bounds: Optional[
     }
 
 
+def _bounds_area_square_meters(bounds: dict[str, Any]):
+    try:
+        south = float(bounds["south"])
+        north = float(bounds["north"])
+        west = float(bounds["west"])
+        east = float(bounds["east"])
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+    center_latitude = (south + north) / 2
+    center_longitude = (west + east) / 2
+    width_m = _haversine_meters(center_latitude, west, center_latitude, east)
+    height_m = _haversine_meters(south, center_longitude, north, center_longitude)
+    return max(width_m * height_m, 0.0)
+
+
+def _inset_bounds(bounds: dict[str, Any], latitude: float, inset_m: float):
+    try:
+        south = float(bounds["south"]) + _meters_to_lat_delta(inset_m)
+        north = float(bounds["north"]) - _meters_to_lat_delta(inset_m)
+        west = float(bounds["west"]) + _meters_to_lon_delta(inset_m, latitude)
+        east = float(bounds["east"]) - _meters_to_lon_delta(inset_m, latitude)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if south >= north or west >= east:
+        return None
+
+    return {
+        "south": round(south, 6),
+        "north": round(north, 6),
+        "west": round(west, 6),
+        "east": round(east, 6),
+    }
+
+
+def _classify_parcel_shape(width_m: float, height_m: float):
+    if height_m <= 0:
+        return "unknown"
+
+    ratio = width_m / height_m
+    if ratio >= 1.45:
+        return "wide"
+    if ratio <= 0.72:
+        return "deep"
+    return "compact"
+
+
+def _classify_terrain_limit(terrain_context: dict[str, Any]):
+    slope_percent = _safe_float(terrain_context.get("slope_percent"), 0) or 0
+    terrain_class = terrain_context.get("terrain_class") or "flat"
+
+    if terrain_class == "steep" or slope_percent >= 12:
+        return "high"
+    if terrain_class == "rolling" or slope_percent >= 7:
+        return "moderate"
+    return "low"
+
+
+def _build_parcel_context(
+    latitude: float,
+    envelope: dict[str, Any],
+    building_context: dict[str, Any],
+    canopy_context: dict[str, Any],
+    terrain_context: dict[str, Any],
+):
+    bounds = envelope.get("bounds") or {}
+    width_m = _safe_float(envelope.get("width_m"), 0) or 0
+    height_m = _safe_float(envelope.get("height_m"), 0) or 0
+    gross_area_sq_m = _bounds_area_square_meters(bounds)
+    gross_area_sq_ft = gross_area_sq_m * SQ_METERS_TO_SQ_FEET
+
+    shortest_edge_m = max(min(width_m, height_m), 4.0)
+    raw_edge_buffer_m = _clamp(shortest_edge_m * 0.12, 2.5, 6.0)
+    max_edge_buffer_m = max(shortest_edge_m / 2 - 1.0, 1.5)
+    edge_buffer_m = min(raw_edge_buffer_m, max_edge_buffer_m)
+
+    planning_core_bounds = _inset_bounds(bounds, latitude, edge_buffer_m)
+    planning_core_area_sq_m = _bounds_area_square_meters(planning_core_bounds) if planning_core_bounds else 0.0
+    planning_core_area_sq_ft = planning_core_area_sq_m * SQ_METERS_TO_SQ_FEET
+    planning_core_share = (
+        planning_core_area_sq_m / gross_area_sq_m
+        if gross_area_sq_m > 0
+        else 0.0
+    )
+
+    building_pressure = building_context.get("directional_pressure") or {}
+    canopy_pressure = canopy_context.get("directional_pressure") or {}
+    terrain_aspect = terrain_context.get("dominant_aspect") or "flat"
+    terrain_limit = _classify_terrain_limit(terrain_context)
+
+    terrain_open_bonus = {
+        "north": 0.0,
+        "south": 0.0,
+        "east": 0.0,
+        "west": 0.0,
+    }
+    if terrain_aspect == "south-facing":
+        terrain_open_bonus["south"] = 0.14
+        terrain_open_bonus["north"] = -0.06
+    elif terrain_aspect == "north-facing":
+        terrain_open_bonus["north"] = 0.08
+        terrain_open_bonus["south"] = -0.10
+    elif terrain_aspect == "east-facing":
+        terrain_open_bonus["east"] = 0.05
+        terrain_open_bonus["west"] = -0.03
+    elif terrain_aspect == "west-facing":
+        terrain_open_bonus["west"] = 0.05
+        terrain_open_bonus["east"] = -0.03
+
+    directional_open_score = {}
+    for direction in ("north", "south", "east", "west"):
+        combined_pressure = (
+            (_safe_float(building_pressure.get(direction), 0) or 0)
+            + ((_safe_float(canopy_pressure.get(direction), 0) or 0) * 0.85)
+        )
+        directional_open_score[direction] = _round(
+            max(0.0, 1.65 - combined_pressure + terrain_open_bonus.get(direction, 0.0)),
+            2,
+        )
+
+    open_side = max(directional_open_score, key=directional_open_score.get)
+    building_penalty_share = min(
+        (
+            (_safe_float((building_context.get("nearest_building") or {}).get("shadow_pressure"), 0) or 0)
+            * 0.08
+        )
+        + ((len(building_context.get("nearby_buildings") or []) * 0.015)),
+        0.18,
+    )
+    canopy_penalty_share = min(
+        (
+            (_safe_float((canopy_context.get("nearest_canopy") or {}).get("canopy_pressure"), 0) or 0)
+            * 0.07
+        )
+        + ((len(canopy_context.get("nearby_canopy") or []) * 0.01)),
+        0.12,
+    )
+    terrain_penalty_share = 0.12 if terrain_limit == "high" else 0.06 if terrain_limit == "moderate" else 0.0
+    minimum_share = 0.12 if planning_core_share > 0 else 0.0
+    maximum_share = planning_core_share if planning_core_share > 0 else 0.0
+    estimated_plantable_share = _clamp(
+        planning_core_share - building_penalty_share - canopy_penalty_share - terrain_penalty_share,
+        minimum_share,
+        maximum_share,
+    )
+    estimated_plantable_area_sq_m = gross_area_sq_m * estimated_plantable_share
+    estimated_plantable_area_sq_ft = estimated_plantable_area_sq_m * SQ_METERS_TO_SQ_FEET
+
+    return {
+        "source": envelope.get("source") or "planning-envelope",
+        "label": "Planning core",
+        "bounds": bounds,
+        "gross_area_sq_m": _round(gross_area_sq_m, 1),
+        "gross_area_sq_ft": _round(gross_area_sq_ft, 0),
+        "shape_class": _classify_parcel_shape(width_m, height_m),
+        "edge_buffer_m": _round(edge_buffer_m, 1),
+        "planning_core_bounds": planning_core_bounds,
+        "planning_core_area_sq_m": _round(planning_core_area_sq_m, 1),
+        "planning_core_area_sq_ft": _round(planning_core_area_sq_ft, 0),
+        "planning_core_share": _round(planning_core_share, 2),
+        "estimated_plantable_share": _round(estimated_plantable_share, 2),
+        "estimated_plantable_area_sq_m": _round(estimated_plantable_area_sq_m, 1),
+        "estimated_plantable_area_sq_ft": _round(estimated_plantable_area_sq_ft, 0),
+        "terrain_limit": terrain_limit,
+        "open_side": open_side,
+        "directional_open_score": directional_open_score,
+        "summary": (
+            f"Planning envelope covers about {gross_area_sq_ft:.0f} sq ft. "
+            f"An inset planning core keeps about {planning_core_area_sq_ft:.0f} sq ft away from edge effects, "
+            f"with the most open side looking {open_side} and {terrain_limit} terrain constraint."
+        ),
+    }
+
+
 def _build_overpass_buildings(latitude: float, longitude: float, radius_m: int):
     query = (
         f'[out:json][timeout:20];'
         f'way["building"](around:{radius_m},{latitude},{longitude});'
         f'out tags geom center;'
+    )
+    return _fetch_json(
+        OVERPASS_INTERPRETER_URL,
+        params={"data": query},
+        ttl_seconds=86400,
     )
 
 
@@ -296,16 +543,28 @@ def _build_overpass_canopy(latitude: float, longitude: float, radius_m: int):
         params={"data": query},
         ttl_seconds=86400,
     )
-    return _fetch_json(
-        OVERPASS_INTERPRETER_URL,
-        params={"data": query},
-        ttl_seconds=86400,
-    )
 
 
 def _build_building_context(latitude: float, longitude: float, envelope: dict[str, Any]):
     radius_m = int(_clamp(max(envelope.get("width_m") or 0, envelope.get("height_m") or 0) * 0.95, 50, 95))
-    payload = _build_overpass_buildings(latitude, longitude, radius_m)
+    try:
+        payload = _build_overpass_buildings(latitude, longitude, radius_m)
+    except requests.RequestException:
+        return {
+            "source": "openstreetmap-overpass",
+            "search_radius_m": radius_m,
+            "building_count": 0,
+            "nearby_buildings": [],
+            "nearest_building": None,
+            "directional_pressure": {
+                "north": 0.0,
+                "south": 0.0,
+                "east": 0.0,
+                "west": 0.0,
+            },
+            "obstruction_risk": "low",
+            "summary": "Mapped building context is unavailable for this property right now.",
+        }
     directional_scores = {"north": 0.0, "south": 0.0, "east": 0.0, "west": 0.0}
     nearby_buildings = []
 
@@ -337,6 +596,9 @@ def _build_building_context(latitude: float, longitude: float, envelope: dict[st
         direction_group = _direction_group(direction_bucket)
         tags = element.get("tags") or {}
         height_m = _parse_height_meters(tags)
+        geometry = _build_polygon_geometry(geometry_points)
+        footprint_area_square_meters = _polygon_area_square_meters(geometry_points)
+        dominant_edge = _dominant_edge(geometry_points)
         shadow_pressure = min(height_m / max(distance_m, 6), 2.5)
         directional_scores[direction_group] = directional_scores.get(direction_group, 0.0) + shadow_pressure
 
@@ -353,8 +615,20 @@ def _build_building_context(latitude: float, longitude: float, envelope: dict[st
                 "direction_group": direction_group,
                 "shadow_pressure": _round(shadow_pressure, 2),
                 "obstruction_risk": _classify_pressure(shadow_pressure),
+                "footprint_area_square_meters": _round(footprint_area_square_meters, 1),
+                "footprint_area_square_feet": (
+                    _round(footprint_area_square_meters * SQ_METERS_TO_SQ_FEET, 1)
+                    if footprint_area_square_meters is not None
+                    else None
+                ),
+                "centroid_within_match_envelope": _point_within_bounds(
+                    centroid,
+                    envelope.get("bounds"),
+                ),
+                "dominant_edge_bearing": dominant_edge.get("bearing") if dominant_edge else None,
+                "dominant_edge_length_m": dominant_edge.get("length_m") if dominant_edge else None,
                 "centroid": centroid,
-                "geometry": _build_polygon_geometry(geometry_points),
+                "geometry": geometry,
             }
         )
 
@@ -397,6 +671,153 @@ def _build_building_context(latitude: float, longitude: float, envelope: dict[st
         },
         "obstruction_risk": _classify_pressure(combined_pressure),
         "summary": summary,
+    }
+
+
+def _is_primary_roof_candidate_kind(building_kind: Optional[str]):
+    normalized_kind = str(building_kind or "").strip().lower()
+    if not normalized_kind:
+        return True
+
+    disfavored_kinds = {
+        "barn",
+        "carport",
+        "garage",
+        "garages",
+        "greenhouse",
+        "hut",
+        "kiosk",
+        "roof",
+        "service",
+        "shed",
+        "silo",
+        "storage_tank",
+    }
+    return normalized_kind not in disfavored_kinds
+
+
+def _build_unavailable_roof_capacity_context(summary: str):
+    return {
+        "available": False,
+        "candidate_building_id": None,
+        "candidate_building_name": None,
+        "candidate_building_kind": None,
+        "candidate_building_distance_m": None,
+        "centroid_within_match_envelope": False,
+        "gross_footprint_area_square_meters": None,
+        "gross_footprint_area_square_feet": None,
+        "usable_roof_area_square_meters": None,
+        "usable_roof_area_square_feet": None,
+        "recommended_system_size_kw": None,
+        "dominant_edge_bearing": None,
+        "dominant_edge_length_m": None,
+        "confidence": "low",
+        "summary": summary,
+        "model_note": (
+            "Roof-capacity inference is only emitted when a nearby primary building footprint looks "
+            "confident enough to stand in for the main roof."
+        ),
+    }
+
+
+def _build_roof_capacity_context(
+    envelope: dict[str, Any],
+    building_context: dict[str, Any],
+    match_quality: Optional[str],
+):
+    nearby_buildings = list(building_context.get("nearby_buildings") or [])
+    candidate_buildings = [
+        building
+        for building in nearby_buildings
+        if (building.get("footprint_area_square_meters") or 0) >= 20
+    ]
+    if not candidate_buildings:
+        return _build_unavailable_roof_capacity_context(
+            "No confident primary building footprint was available to infer parcel roof capacity."
+        )
+
+    primary_building = sorted(
+        candidate_buildings,
+        key=lambda building: (
+            0 if building.get("centroid_within_match_envelope") else 1,
+            0 if _is_primary_roof_candidate_kind(building.get("kind")) else 1,
+            -(building.get("footprint_area_square_meters") or 0),
+            building.get("distance_m") or 9999,
+        ),
+    )[0]
+
+    gross_area_square_meters = float(primary_building.get("footprint_area_square_meters") or 0)
+    centroid_within_match_envelope = bool(
+        primary_building.get("centroid_within_match_envelope")
+    )
+    candidate_distance_m = float(primary_building.get("distance_m") or 9999)
+    max_distance_m = max(float(envelope.get("width_m") or 0) * 0.55, 28.0)
+    if gross_area_square_meters < 25 or (
+        not centroid_within_match_envelope and candidate_distance_m > max_distance_m
+    ):
+        return _build_unavailable_roof_capacity_context(
+            "Nearby building footprints were found, but none were confident enough to stand in for the main roof."
+        )
+
+    usable_roof_area_square_meters = gross_area_square_meters * ROOF_COVERAGE_FACTOR
+    usable_roof_area_square_feet = usable_roof_area_square_meters * SQ_METERS_TO_SQ_FEET
+    recommended_system_size_kw = _round(
+        _clamp(
+            usable_roof_area_square_meters * BASELINE_PANEL_EFFICIENCY,
+            1.5,
+            18.0,
+        ),
+        2,
+    )
+
+    confidence_score = 0
+    if centroid_within_match_envelope:
+        confidence_score += 2
+    if _is_primary_roof_candidate_kind(primary_building.get("kind")):
+        confidence_score += 1
+    if match_quality == "high":
+        confidence_score += 2
+    elif match_quality == "medium":
+        confidence_score += 1
+    if gross_area_square_meters >= 110:
+        confidence_score += 1
+
+    confidence = (
+        "high"
+        if confidence_score >= 5
+        else "medium"
+        if confidence_score >= 3
+        else "low"
+    )
+
+    return {
+        "available": True,
+        "candidate_building_id": primary_building.get("id"),
+        "candidate_building_name": primary_building.get("name"),
+        "candidate_building_kind": primary_building.get("kind"),
+        "candidate_building_distance_m": _round(candidate_distance_m, 1),
+        "centroid_within_match_envelope": centroid_within_match_envelope,
+        "gross_footprint_area_square_meters": _round(gross_area_square_meters, 1),
+        "gross_footprint_area_square_feet": _round(
+            gross_area_square_meters * SQ_METERS_TO_SQ_FEET,
+            1,
+        ),
+        "usable_roof_area_square_meters": _round(usable_roof_area_square_meters, 1),
+        "usable_roof_area_square_feet": _round(usable_roof_area_square_feet, 1),
+        "recommended_system_size_kw": recommended_system_size_kw,
+        "dominant_edge_bearing": primary_building.get("dominant_edge_bearing"),
+        "dominant_edge_length_m": primary_building.get("dominant_edge_length_m"),
+        "confidence": confidence,
+        "summary": (
+            f"Matched building footprint suggests about {round(gross_area_square_meters * SQ_METERS_TO_SQ_FEET):,} sq ft "
+            f"of gross roof area, roughly {round(usable_roof_area_square_feet):,} sq ft of usable solar area, "
+            f"and about {recommended_system_size_kw:.1f} kW of baseline capacity."
+        ),
+        "model_note": (
+            "Roof-capacity inference is conservative and uses the matched building footprint, a "
+            f"{ROOF_COVERAGE_FACTOR * 100:.0f}% usable-roof allowance, and "
+            f"{BASELINE_PANEL_EFFICIENCY * 100:.0f}% baseline panel efficiency."
+        ),
     }
 
 
@@ -648,24 +1069,37 @@ def get_property_context_snapshot(
     building_context = _build_building_context(latitude, longitude, envelope)
     terrain_context = _build_terrain_context(latitude, longitude, envelope)
     canopy_context = _build_canopy_context(latitude, longitude, envelope)
+    parcel_context = _build_parcel_context(latitude, envelope, building_context, canopy_context, terrain_context)
     shade_context = _build_shade_context(building_context, terrain_context, canopy_context)
+    roof_capacity_context = _build_roof_capacity_context(
+        envelope,
+        building_context,
+        match_quality,
+    )
+
+    summary = (
+        f"{building_context.get('summary')} {canopy_context.get('summary')} {terrain_context.get('summary')} "
+        f"{parcel_context.get('summary')} {shade_context.get('summary')}"
+    )
+    if roof_capacity_context.get("available"):
+        summary = f"{summary} {roof_capacity_context.get('summary')}"
 
     return {
-        "context_version": "property-context-v2",
+        "context_version": "property-context-v3",
         "latitude": round(latitude, 6),
         "longitude": round(longitude, 6),
         "match_quality": match_quality or "unknown",
         "match_envelope": envelope,
+        "parcel_context": parcel_context,
         "building_context": building_context,
         "canopy_context": canopy_context,
         "terrain_context": terrain_context,
         "shade_context": shade_context,
-        "summary": (
-            f"{building_context.get('summary')} {canopy_context.get('summary')} {terrain_context.get('summary')} "
-            f"{shade_context.get('summary')}"
-        ),
+        "roof_capacity_context": roof_capacity_context,
+        "summary": summary,
         "model_note": (
-            "This context layer uses nearby OpenStreetMap building and vegetation features plus SRTM terrain samples. "
-            "It still does not include parcel-certified boundaries, fence lines, or tree-perfect canopy geometry."
+            "This context layer uses nearby OpenStreetMap building and vegetation features plus SRTM terrain samples "
+            "and an inset planning core derived from the address match envelope. It still does not include "
+            "parcel-certified boundaries, fence lines, or tree-perfect canopy geometry."
         ),
     }
