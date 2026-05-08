@@ -97,6 +97,9 @@ def build_garden_zone(index=1):
         "centroid": {"lat": round((north + south) / 2, 6), "lng": round((west + east) / 2, 6)},
         "areaSquareMeters": 18.4 + index,
         "areaSquareFeet": 198 + (index * 12),
+        "observedShadeProfile": "half-day-tree-shade" if index == 1 else "auto",
+        "zonePurposeId": "production-bed" if index == 1 else "perennial-border",
+        "careCadenceId": "daily-check" if index == 1 else "weekly-check",
     }
 
 
@@ -472,11 +475,14 @@ class PropertyRecordTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(len(payload["garden_zones"]), 2)
         self.assertEqual(payload["garden_zones"][0]["name"], "Garden zone 1")
+        self.assertEqual(payload["garden_zones"][0]["observedShadeProfile"], "half-day-tree-shade")
+        self.assertEqual(payload["garden_zones"][1]["zonePurposeId"], "perennial-border")
 
         record = data_persistence.get_property_record(payload["guid"])
         self.assertIsNotNone(record)
         self.assertEqual(len(record["garden_zones"]), 2)
         self.assertEqual(record["garden_zones"][1]["id"], "garden-zone-2")
+        self.assertEqual(record["garden_zones"][0]["careCadenceId"], "daily-check")
 
     def test_property_record_endpoint_persists_property_context(self):
         response = self.client.post(
@@ -550,10 +556,12 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertEqual(second_response.status_code, 200)
         payload = second_response.json()
         self.assertEqual(len(payload["garden_zones"]), 2)
+        self.assertEqual(payload["garden_zones"][0]["observedShadeProfile"], "half-day-tree-shade")
 
         record = data_persistence.get_property_record(guid)
         self.assertEqual(record["roof_selection"]["recommendedKw"], 10.5)
         self.assertEqual(len(record["garden_zones"]), 2)
+        self.assertEqual(record["garden_zones"][1]["zonePurposeId"], "perennial-border")
 
     def test_find_property_record_returns_saved_garden_zones_by_address(self):
         property_response = self.client.post(

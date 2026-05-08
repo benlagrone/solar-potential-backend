@@ -5,6 +5,13 @@ import property_context
 
 
 class PropertyContextTests(unittest.TestCase):
+    @staticmethod
+    def _bounds_center(bounds):
+        return (
+            (bounds["south"] + bounds["north"]) / 2,
+            (bounds["west"] + bounds["east"]) / 2,
+        )
+
     def test_build_overpass_buildings_fetches_json_payload(self):
         expected_payload = {"elements": []}
 
@@ -83,6 +90,83 @@ class PropertyContextTests(unittest.TestCase):
         self.assertEqual(parcel_context["terrain_limit"], "moderate")
         self.assertIn(parcel_context["open_side"], {"north", "south", "east", "west"})
         self.assertIn("Planning envelope covers", snapshot["summary"])
+
+    def test_property_context_snapshot_shifts_garden_envelope_away_from_street_side_point(self):
+        building_geometry = {
+            "type": "Polygon",
+            "coordinates": [[
+                [-97.74318, 30.26710],
+                [-97.74302, 30.26710],
+                [-97.74302, 30.26696],
+                [-97.74318, 30.26696],
+                [-97.74318, 30.26710],
+            ]],
+        }
+        primary_building = {
+            "id": "b-1",
+            "kind": "residential",
+            "shadow_pressure": 1.12,
+            "distance_m": 18.0,
+            "footprint_area_square_meters": 78.0,
+            "centroid_within_match_envelope": True,
+            "centroid": {
+                "lat": 30.26703,
+                "lng": -97.74310,
+            },
+            "geometry": building_geometry,
+        }
+        building_context = {
+            "summary": "1 nearby building footprint found.",
+            "directional_pressure": {
+                "north": 0.12,
+                "south": 0.64,
+                "east": 0.18,
+                "west": 0.08,
+            },
+            "nearby_buildings": [primary_building],
+            "nearest_building": primary_building,
+        }
+        canopy_context = {
+            "summary": "1 nearby canopy feature found.",
+            "directional_pressure": {
+                "north": 0.08,
+                "south": 0.14,
+                "east": 0.10,
+                "west": 0.12,
+            },
+            "nearby_canopy": [],
+            "nearest_canopy": None,
+        }
+        terrain_context = {
+            "summary": "Local terrain reads as gentle with a south-facing bias.",
+            "dominant_aspect": "south-facing",
+            "terrain_class": "gentle",
+            "slope_percent": 4.1,
+        }
+
+        with patch.object(property_context, "_build_building_context", return_value=building_context):
+            with patch.object(property_context, "_build_canopy_context", return_value=canopy_context):
+                with patch.object(property_context, "_build_terrain_context", return_value=terrain_context):
+                    snapshot = property_context.get_property_context_snapshot(
+                        30.2672,
+                        -97.7431,
+                        bounds={
+                            "south": 30.2668,
+                            "north": 30.2676,
+                            "west": -97.7437,
+                            "east": -97.7426,
+                        },
+                        match_quality="high",
+                    )
+
+        raw_center_lat, _ = self._bounds_center(snapshot["match_envelope"]["bounds"])
+        planning_center_lat, _ = self._bounds_center(snapshot["parcel_context"]["bounds"])
+        focus_anchor = snapshot["parcel_context"]["focus_anchor"]
+
+        self.assertIsNotNone(focus_anchor)
+        self.assertEqual(focus_anchor["street_side"], "north")
+        self.assertEqual(focus_anchor["garden_side"], "south")
+        self.assertLess(planning_center_lat, raw_center_lat)
 
 
 if __name__ == "__main__":

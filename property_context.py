@@ -378,6 +378,219 @@ def _inset_bounds(bounds: dict[str, Any], latitude: float, inset_m: float):
     }
 
 
+def _directional_inset_bounds(
+    bounds: dict[str, Any],
+    latitude: float,
+    *,
+    north_inset_m: float,
+    south_inset_m: float,
+    east_inset_m: float,
+    west_inset_m: float,
+):
+    try:
+        south = float(bounds["south"]) + _meters_to_lat_delta(south_inset_m)
+        north = float(bounds["north"]) - _meters_to_lat_delta(north_inset_m)
+        west = float(bounds["west"]) + _meters_to_lon_delta(west_inset_m, latitude)
+        east = float(bounds["east"]) - _meters_to_lon_delta(east_inset_m, latitude)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if south >= north or west >= east:
+        return None
+
+    return {
+        "south": round(south, 6),
+        "north": round(north, 6),
+        "west": round(west, 6),
+        "east": round(east, 6),
+    }
+
+
+def _build_centered_bounds(latitude: float, longitude: float, width_m: float, height_m: float):
+    half_height_m = max(height_m / 2, 1.0)
+    half_width_m = max(width_m / 2, 1.0)
+    return {
+        "south": round(latitude - _meters_to_lat_delta(half_height_m), 6),
+        "north": round(latitude + _meters_to_lat_delta(half_height_m), 6),
+        "west": round(longitude - _meters_to_lon_delta(half_width_m, latitude), 6),
+        "east": round(longitude + _meters_to_lon_delta(half_width_m, latitude), 6),
+    }
+
+
+def _opposite_direction_group(direction: Optional[str]):
+    return {
+        "north": "south",
+        "south": "north",
+        "east": "west",
+        "west": "east",
+    }.get(str(direction or "").lower())
+
+
+def _resolve_primary_context_building(
+    building_context: dict[str, Any],
+    roof_capacity_context: Optional[dict[str, Any]] = None,
+):
+    nearby_buildings = list(building_context.get("nearby_buildings") or [])
+    candidate_building_id = (roof_capacity_context or {}).get("candidate_building_id")
+    if candidate_building_id:
+        matched_building = next(
+            (building for building in nearby_buildings if building.get("id") == candidate_building_id),
+            None,
+        )
+        if matched_building:
+            return matched_building
+
+    nearest_building = building_context.get("nearest_building") or {}
+    nearest_building_id = nearest_building.get("id")
+    if nearest_building_id:
+        matched_building = next(
+            (building for building in nearby_buildings if building.get("id") == nearest_building_id),
+            None,
+        )
+        if matched_building:
+            return matched_building
+
+    return nearby_buildings[0] if nearby_buildings else None
+
+
+def _build_garden_focus_bounds(
+    latitude: float,
+    longitude: float,
+    envelope: dict[str, Any],
+    building_context: dict[str, Any],
+    roof_capacity_context: Optional[dict[str, Any]] = None,
+):
+    raw_bounds = envelope.get("bounds") or {}
+    width_m = _safe_float(envelope.get("width_m"), 0) or 0
+    height_m = _safe_float(envelope.get("height_m"), 0) or 0
+    if not raw_bounds or width_m <= 0 or height_m <= 0:
+        return raw_bounds, None
+
+    primary_building = _resolve_primary_context_building(building_context, roof_capacity_context)
+    centroid = (primary_building or {}).get("centroid") or {}
+    centroid_lat = _safe_float(centroid.get("lat"))
+    centroid_lng = _safe_float(centroid.get("lng"))
+    if centroid_lat is None or centroid_lng is None:
+        return raw_bounds, None
+
+    street_bearing = _bearing_degrees(centroid_lat, centroid_lng, latitude, longitude)
+    street_side = _direction_group(_direction_bucket(street_bearing))
+    garden_side = _opposite_direction_group(street_side)
+    if garden_side not in {"north", "south", "east", "west"}:
+        centered_bounds = _build_centered_bounds(centroid_lat, centroid_lng, width_m, height_m)
+        return centered_bounds, {
+            "source": "primary-building-centroid",
+            "primary_building_id": primary_building.get("id"),
+            "street_side": street_side,
+            "garden_side": None,
+            "shift_m": 0.0,
+            "center": {
+                "lat": round(centroid_lat, 6),
+                "lng": round(centroid_lng, 6),
+            },
+        }
+
+    building_area_square_meters = _safe_float(
+        primary_building.get("footprint_area_square_meters"),
+        0,
+    ) or 0
+    building_span_m = math.sqrt(building_area_square_meters) if building_area_square_meters > 0 else 0.0
+    axis_span_m = height_m if garden_side in {"north", "south"} else width_m
+    shift_m = _clamp(
+        max(axis_span_m * 0.22, building_span_m * 0.9, 6.0),
+        6.0,
+        max(axis_span_m * 0.32, 10.0),
+    )
+
+    center_lat = centroid_lat
+    center_lng = centroid_lng
+    if garden_side == "north":
+        center_lat += _meters_to_lat_delta(shift_m)
+    elif garden_side == "south":
+        center_lat -= _meters_to_lat_delta(shift_m)
+    elif garden_side == "east":
+        center_lng += _meters_to_lon_delta(shift_m, centroid_lat)
+    elif garden_side == "west":
+        center_lng -= _meters_to_lon_delta(shift_m, centroid_lat)
+
+    centered_bounds = _build_centered_bounds(center_lat, center_lng, width_m, height_m)
+    return centered_bounds, {
+        "source": "primary-building-centroid",
+        "primary_building_id": primary_building.get("id"),
+        "street_side": street_side,
+        "garden_side": garden_side,
+        "shift_m": _round(shift_m, 1),
+        "center": {
+            "lat": round(center_lat, 6),
+            "lng": round(center_lng, 6),
+        },
+    }
+
+
+def _build_siting_core_bounds(
+    bounds: dict[str, Any],
+    latitude: float,
+    width_m: float,
+    height_m: float,
+    base_inset_m: float,
+    focus_anchor: Optional[dict[str, Any]] = None,
+):
+    street_side = str((focus_anchor or {}).get("street_side") or "").lower()
+    if street_side not in {"north", "south", "east", "west"}:
+        return _inset_bounds(bounds, latitude, base_inset_m), None
+
+    axis_span_m = height_m if street_side in {"north", "south"} else width_m
+    cross_span_m = width_m if street_side in {"north", "south"} else height_m
+
+    street_buffer_m = max(base_inset_m * 3.1, axis_span_m * 0.28, 8.0)
+    garden_buffer_m = max(base_inset_m * 0.55, 1.8)
+    lateral_buffer_m = max(base_inset_m * 0.9, 2.0)
+
+    axis_limit_m = max(axis_span_m - 3.0, 1.0)
+    street_plus_garden_m = street_buffer_m + garden_buffer_m
+    if street_plus_garden_m > axis_limit_m:
+        scale = axis_limit_m / street_plus_garden_m
+        street_buffer_m *= scale
+        garden_buffer_m *= scale
+
+    cross_limit_m = max(cross_span_m - 3.0, 1.0)
+    lateral_pair_m = lateral_buffer_m * 2
+    if lateral_pair_m > cross_limit_m:
+        lateral_buffer_m *= cross_limit_m / lateral_pair_m
+
+    north_inset_m = lateral_buffer_m
+    south_inset_m = lateral_buffer_m
+    east_inset_m = lateral_buffer_m
+    west_inset_m = lateral_buffer_m
+
+    if street_side == "north":
+        north_inset_m = street_buffer_m
+        south_inset_m = garden_buffer_m
+    elif street_side == "south":
+        south_inset_m = street_buffer_m
+        north_inset_m = garden_buffer_m
+    elif street_side == "east":
+        east_inset_m = street_buffer_m
+        west_inset_m = garden_buffer_m
+    elif street_side == "west":
+        west_inset_m = street_buffer_m
+        east_inset_m = garden_buffer_m
+
+    return _directional_inset_bounds(
+        bounds,
+        latitude,
+        north_inset_m=north_inset_m,
+        south_inset_m=south_inset_m,
+        east_inset_m=east_inset_m,
+        west_inset_m=west_inset_m,
+    ), {
+        "street_side": street_side,
+        "street_buffer_m": _round(street_buffer_m, 1),
+        "garden_buffer_m": _round(garden_buffer_m, 1),
+        "lateral_buffer_m": _round(lateral_buffer_m, 1),
+    }
+
+
 def _classify_parcel_shape(width_m: float, height_m: float):
     if height_m <= 0:
         return "unknown"
@@ -403,12 +616,20 @@ def _classify_terrain_limit(terrain_context: dict[str, Any]):
 
 def _build_parcel_context(
     latitude: float,
+    longitude: float,
     envelope: dict[str, Any],
     building_context: dict[str, Any],
     canopy_context: dict[str, Any],
     terrain_context: dict[str, Any],
+    roof_capacity_context: Optional[dict[str, Any]] = None,
 ):
-    bounds = envelope.get("bounds") or {}
+    bounds, focus_anchor = _build_garden_focus_bounds(
+        latitude,
+        longitude,
+        envelope,
+        building_context,
+        roof_capacity_context,
+    )
     width_m = _safe_float(envelope.get("width_m"), 0) or 0
     height_m = _safe_float(envelope.get("height_m"), 0) or 0
     gross_area_sq_m = _bounds_area_square_meters(bounds)
@@ -419,7 +640,14 @@ def _build_parcel_context(
     max_edge_buffer_m = max(shortest_edge_m / 2 - 1.0, 1.5)
     edge_buffer_m = min(raw_edge_buffer_m, max_edge_buffer_m)
 
-    planning_core_bounds = _inset_bounds(bounds, latitude, edge_buffer_m)
+    planning_core_bounds, planning_core_focus = _build_siting_core_bounds(
+        bounds,
+        latitude,
+        width_m,
+        height_m,
+        edge_buffer_m,
+        focus_anchor,
+    )
     planning_core_area_sq_m = _bounds_area_square_meters(planning_core_bounds) if planning_core_bounds else 0.0
     planning_core_area_sq_ft = planning_core_area_sq_m * SQ_METERS_TO_SQ_FEET
     planning_core_share = (
@@ -492,8 +720,12 @@ def _build_parcel_context(
     estimated_plantable_area_sq_ft = estimated_plantable_area_sq_m * SQ_METERS_TO_SQ_FEET
 
     return {
-        "source": envelope.get("source") or "planning-envelope",
-        "label": "Planning core",
+        "source": (
+            "building-anchored-planning-envelope"
+            if focus_anchor
+            else envelope.get("source") or "planning-envelope"
+        ),
+        "label": "Garden planning envelope",
         "bounds": bounds,
         "gross_area_sq_m": _round(gross_area_sq_m, 1),
         "gross_area_sq_ft": _round(gross_area_sq_ft, 0),
@@ -509,10 +741,23 @@ def _build_parcel_context(
         "terrain_limit": terrain_limit,
         "open_side": open_side,
         "directional_open_score": directional_open_score,
+        "focus_anchor": focus_anchor,
+        "planning_core_focus": planning_core_focus,
         "summary": (
             f"Planning envelope covers about {gross_area_sq_ft:.0f} sq ft. "
             f"An inset planning core keeps about {planning_core_area_sq_ft:.0f} sq ft away from edge effects, "
             f"with the most open side looking {open_side} and {terrain_limit} terrain constraint."
+            + (
+                f" The envelope is shifted toward the {focus_anchor.get('garden_side')} side of the matched building "
+                f"to pull away from the street-side address point."
+                if focus_anchor and focus_anchor.get("garden_side")
+                else ""
+            )
+            + (
+                f" The siting core is also pulled away from the {planning_core_focus.get('street_side')} street edge."
+                if planning_core_focus and planning_core_focus.get("street_side")
+                else ""
+            )
         ),
     }
 
@@ -1067,15 +1312,23 @@ def get_property_context_snapshot(
 ):
     envelope = _build_context_envelope(latitude, longitude, bounds)
     building_context = _build_building_context(latitude, longitude, envelope)
-    terrain_context = _build_terrain_context(latitude, longitude, envelope)
-    canopy_context = _build_canopy_context(latitude, longitude, envelope)
-    parcel_context = _build_parcel_context(latitude, envelope, building_context, canopy_context, terrain_context)
-    shade_context = _build_shade_context(building_context, terrain_context, canopy_context)
     roof_capacity_context = _build_roof_capacity_context(
         envelope,
         building_context,
         match_quality,
     )
+    terrain_context = _build_terrain_context(latitude, longitude, envelope)
+    canopy_context = _build_canopy_context(latitude, longitude, envelope)
+    parcel_context = _build_parcel_context(
+        latitude,
+        longitude,
+        envelope,
+        building_context,
+        canopy_context,
+        terrain_context,
+        roof_capacity_context,
+    )
+    shade_context = _build_shade_context(building_context, terrain_context, canopy_context)
 
     summary = (
         f"{building_context.get('summary')} {canopy_context.get('summary')} {terrain_context.get('summary')} "
@@ -1099,7 +1352,7 @@ def get_property_context_snapshot(
         "summary": summary,
         "model_note": (
             "This context layer uses nearby OpenStreetMap building and vegetation features plus SRTM terrain samples "
-            "and an inset planning core derived from the address match envelope. It still does not include "
+            "and a building-anchored garden planning envelope derived from the address match envelope. It still does not include "
             "parcel-certified boundaries, fence lines, or tree-perfect canopy geometry."
         ),
     }

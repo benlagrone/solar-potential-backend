@@ -85,6 +85,9 @@ class GardenZone(BaseModel):
     centroid: Optional[dict] = None
     areaSquareMeters: float
     areaSquareFeet: float
+    observedShadeProfile: Optional[str] = None
+    zonePurposeId: Optional[str] = None
+    careCadenceId: Optional[str] = None
 
 
 class PreviewBounds(BaseModel):
