@@ -83,8 +83,12 @@ class PropertyContextTests(unittest.TestCase):
                     )
 
         parcel_context = snapshot["parcel_context"]
-        self.assertEqual(snapshot["context_version"], "property-context-v3")
+        self.assertEqual(snapshot["context_version"], "property-context-v4")
         self.assertIsNotNone(parcel_context["planning_core_bounds"])
+        self.assertIn("parcel_intelligence", snapshot)
+        self.assertIn("tree_canopy_context", snapshot)
+        self.assertIn("garden_sun_context", snapshot)
+        self.assertEqual(snapshot["garden_sun_context"]["cloud_adjustment"]["status"], "uses-property-climate-when-loaded")
         self.assertGreater(parcel_context["gross_area_sq_ft"], parcel_context["planning_core_area_sq_ft"])
         self.assertGreater(parcel_context["planning_core_share"], parcel_context["estimated_plantable_share"])
         self.assertEqual(parcel_context["terrain_limit"], "moderate")
@@ -167,6 +171,108 @@ class PropertyContextTests(unittest.TestCase):
         self.assertEqual(focus_anchor["street_side"], "north")
         self.assertEqual(focus_anchor["garden_side"], "south")
         self.assertLess(planning_center_lat, raw_center_lat)
+
+    def test_parcel_intelligence_scores_primary_structure_candidate(self):
+        primary_building = {
+            "id": "b-1",
+            "name": "Main house",
+            "kind": "house",
+            "shadow_pressure": 0.48,
+            "distance_m": 10.0,
+            "footprint_area_square_meters": 140.0,
+            "footprint_area_square_feet": 1507.0,
+            "centroid_within_match_envelope": True,
+            "dominant_edge_bearing": 90,
+            "dominant_edge_length_m": 16.0,
+            "centroid": {
+                "lat": 30.26718,
+                "lng": -97.74308,
+            },
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [-97.74318, 30.26724],
+                    [-97.74298, 30.26724],
+                    [-97.74298, 30.26708],
+                    [-97.74318, 30.26708],
+                    [-97.74318, 30.26724],
+                ]],
+            },
+        }
+        shed = {
+            "id": "b-2",
+            "name": "Shed",
+            "kind": "shed",
+            "shadow_pressure": 0.2,
+            "distance_m": 23.0,
+            "footprint_area_square_meters": 32.0,
+            "footprint_area_square_feet": 344.0,
+            "centroid_within_match_envelope": True,
+            "centroid": {
+                "lat": 30.26694,
+                "lng": -97.74330,
+            },
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [-97.74334, 30.26699],
+                    [-97.74325, 30.26699],
+                    [-97.74325, 30.26691],
+                    [-97.74334, 30.26691],
+                    [-97.74334, 30.26699],
+                ]],
+            },
+        }
+        building_context = {
+            "summary": "2 nearby building footprints found.",
+            "directional_pressure": {
+                "north": 0.2,
+                "south": 0.4,
+                "east": 0.1,
+                "west": 0.1,
+            },
+            "nearby_buildings": [shed, primary_building],
+            "nearest_building": primary_building,
+        }
+        canopy_context = {
+            "summary": "No nearby canopy features were found.",
+            "directional_pressure": {
+                "north": 0,
+                "south": 0,
+                "east": 0,
+                "west": 0,
+            },
+            "nearby_canopy": [],
+            "nearest_canopy": None,
+        }
+        terrain_context = {
+            "summary": "Local terrain reads as flat.",
+            "dominant_aspect": "flat",
+            "terrain_class": "flat",
+            "slope_percent": 0.5,
+        }
+
+        with patch.object(property_context, "_build_building_context", return_value=building_context):
+            with patch.object(property_context, "_build_canopy_context", return_value=canopy_context):
+                with patch.object(property_context, "_build_terrain_context", return_value=terrain_context):
+                    snapshot = property_context.get_property_context_snapshot(
+                        30.2672,
+                        -97.7431,
+                        bounds={
+                            "south": 30.2668,
+                            "north": 30.2676,
+                            "west": -97.7437,
+                            "east": -97.7426,
+                        },
+                        match_quality="high",
+                    )
+
+        intelligence = snapshot["parcel_intelligence"]
+        self.assertTrue(intelligence["available"])
+        self.assertEqual(intelligence["primary_structure"]["building_id"], "b-1")
+        self.assertGreaterEqual(intelligence["primary_structure_confidence_score"], 80)
+        self.assertIn("solar", intelligence["feature_coverage"])
+        self.assertFalse(intelligence["parcel"]["certified_boundary"])
 
 
 if __name__ == "__main__":

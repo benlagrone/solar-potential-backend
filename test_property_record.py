@@ -75,6 +75,59 @@ def build_west_facing_roof_selection():
     }
 
 
+def build_multi_plane_roof_selection():
+    south_plane = {
+        "id": "roof-plane-1",
+        "name": "Roof plane 1",
+        "geometry": build_roof_selection()["geometry"],
+        "centroid": build_roof_selection()["centroid"],
+        "areaSquareMeters": 92.9,
+        "areaSquareFeet": 1000,
+        "usableAreaSquareMeters": 78.0,
+        "usableAreaSquareFeet": 839,
+        "setbackAreaSquareMeters": 14.9,
+        "setbackAreaSquareFeet": 161,
+        "setbackFeet": 3.0,
+        "dominantEdgeBearing": 89.9,
+        "dominantEdgeLengthMeters": 48.1,
+        "assumedAzimuth": 180.0,
+        "facingLabel": "South",
+        "recommendedKw": 1.8,
+    }
+    west_plane = {
+        "id": "roof-plane-2",
+        "name": "Roof plane 2",
+        "geometry": build_west_facing_roof_selection()["geometry"],
+        "centroid": build_west_facing_roof_selection()["centroid"],
+        "areaSquareMeters": 84.0,
+        "areaSquareFeet": 904,
+        "usableAreaSquareMeters": 70.0,
+        "usableAreaSquareFeet": 753,
+        "setbackAreaSquareMeters": 14.0,
+        "setbackAreaSquareFeet": 151,
+        "setbackFeet": 3.0,
+        "dominantEdgeBearing": 180.0,
+        "dominantEdgeLengthMeters": 88.0,
+        "assumedAzimuth": 270.0,
+        "facingLabel": "West",
+        "recommendedKw": 1.6,
+    }
+    return {
+        "geometry": south_plane["geometry"],
+        "centroid": {"lat": 30.2674, "lng": -97.74325},
+        "areaSquareMeters": 176.9,
+        "areaSquareFeet": 1904,
+        "usableAreaSquareMeters": 148.0,
+        "usableAreaSquareFeet": 1592,
+        "setbackAreaSquareMeters": 28.9,
+        "setbackAreaSquareFeet": 312,
+        "planeCount": 2,
+        "dominantPlaneId": "roof-plane-1",
+        "recommendedKw": 3.4,
+        "planes": [south_plane, west_plane],
+    }
+
+
 def build_garden_zone(index=1):
     west = -97.7438 + (index * 0.00045)
     east = west + 0.00032
@@ -461,6 +514,28 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertEqual(record["roof_selection"]["recommendedKw"], 10.5)
         self.assertEqual(record["property_preview"]["formatted_address"], build_property_preview()["formatted_address"])
 
+    def test_property_record_endpoint_persists_multi_plane_roof_selection(self):
+        response = self.client.post(
+            "/api/property-record",
+            json={
+                "address": build_address(),
+                "property_preview": build_property_preview(),
+                "roof_selection": build_multi_plane_roof_selection(),
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["roof_selection"]["planeCount"], 2)
+        self.assertEqual(len(payload["roof_selection"]["planes"]), 2)
+        self.assertEqual(payload["roof_selection"]["planes"][1]["facingLabel"], "West")
+        self.assertEqual(payload["roof_selection"]["planes"][0]["setbackFeet"], 3.0)
+
+        record = data_persistence.get_property_record(payload["guid"])
+        self.assertIsNotNone(record)
+        self.assertEqual(record["roof_selection"]["usableAreaSquareFeet"], 1592)
+        self.assertEqual(record["roof_selection"]["planes"][0]["name"], "Roof plane 1")
+
     def test_property_record_endpoint_persists_garden_zones(self):
         response = self.client.post(
             "/api/property-record",
@@ -742,10 +817,59 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertEqual(payload["production_model"]["id"], "roof-backed-monthly-v2")
         self.assertEqual(payload["data_provider"], "nasa")
         self.assertEqual(payload["production_model"]["peak_month"]["month"], "01")
-        self.assertAlmostEqual(payload["monthly_production"]["01"], 1363.7, places=1)
+        self.assertAlmostEqual(payload["monthly_production"]["01"], 1364.0, places=1)
         self.assertGreater(payload["annual_production"], 16000)
         self.assertGreater(payload["specific_yield"], 1500)
         self.assertGreater(payload["capacity_factor"], 0.17)
+
+    def test_solar_potential_uses_multi_plane_roof_selection(self):
+        property_response = self.client.post(
+            "/api/property-record",
+            json={
+                "address": build_address(),
+                "property_preview": build_property_preview(),
+                "property_context": build_property_context(),
+                "roof_selection": build_multi_plane_roof_selection(),
+            },
+        )
+        guid = property_response.json()["guid"]
+
+        with patch.object(main, "get_nrel_api_key", return_value=None):
+            with patch.object(main, "check_existing_zip_data", return_value=(None, None)):
+                with patch.object(main, "geocode_address", return_value=(30.2672, -97.7431)):
+                    with patch.object(main, "get_nasa_power_data", return_value=build_solar_data()):
+                        with patch.object(main, "get_timezone", return_value="America/Chicago"):
+                            response = self.client.post(
+                                "/api/solar-potential",
+                                json={
+                                    "guid": guid,
+                                    "panel_efficiency": 0.2,
+                                    "electricity_rate": 0.16,
+                                    "installation_cost_per_watt": 3.0,
+                                },
+                            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["sizing_source"], "roof-geometry")
+        self.assertEqual(payload["production_model"]["id"], "roof-backed-monthly-v2")
+        self.assertEqual(payload["production_model"]["roof_plane_count"], 2)
+        self.assertAlmostEqual(
+            payload["production_model"]["usable_roof_area_square_feet"],
+            1593.1,
+            places=1,
+        )
+        self.assertGreater(payload["production_model"]["setback_area_square_feet"], 300)
+        self.assertEqual(len(payload["production_model"]["roof_planes"]), 2)
+        self.assertNotEqual(
+            payload["production_model"]["roof_planes"][0]["assumed_azimuth"],
+            payload["production_model"]["roof_planes"][1]["assumed_azimuth"],
+        )
+        self.assertIn("saved roof plane", payload["sizing_note"].lower())
+        self.assertIn(
+            "Multiple roof planes are modeled separately instead of one blended roof bucket.",
+            payload["confidence"]["factors"],
+        )
 
     def test_solar_potential_uses_saved_property_context_for_site_losses(self):
         property_response = self.client.post(

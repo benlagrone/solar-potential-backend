@@ -185,6 +185,32 @@ def _build_point_geometry(point: Optional[dict[str, float]]):
     }
 
 
+def _build_bounds_geometry(bounds: Optional[dict[str, Any]]):
+    if not bounds:
+        return None
+    try:
+        south = float(bounds["south"])
+        north = float(bounds["north"])
+        west = float(bounds["west"])
+        east = float(bounds["east"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if south >= north or west >= east:
+        return None
+
+    return {
+        "type": "Polygon",
+        "coordinates": [[
+            [round(west, 6), round(north, 6)],
+            [round(east, 6), round(north, 6)],
+            [round(east, 6), round(south, 6)],
+            [round(west, 6), round(south, 6)],
+            [round(west, 6), round(north, 6)],
+        ]],
+    }
+
+
 def _point_within_bounds(point: Optional[dict[str, float]], bounds: Optional[dict[str, Any]]):
     if not point or not bounds:
         return False
@@ -941,6 +967,174 @@ def _is_primary_roof_candidate_kind(building_kind: Optional[str]):
     return normalized_kind not in disfavored_kinds
 
 
+def _score_structure_candidate(
+    building: dict[str, Any],
+    *,
+    largest_area_square_meters: float,
+    envelope: dict[str, Any],
+    match_quality: Optional[str],
+):
+    score = 0
+    reasons = []
+    penalties = []
+
+    if building.get("centroid_within_match_envelope"):
+        score += 50
+        reasons.append("inside parcel candidate")
+    elif (building.get("distance_m") or 9999) <= max(float(envelope.get("width_m") or 0) * 0.55, 28.0):
+        score += 20
+        reasons.append("near address match")
+    else:
+        penalties.append("outside parcel candidate")
+
+    footprint_area = float(building.get("footprint_area_square_meters") or 0)
+    if footprint_area > 0 and footprint_area == largest_area_square_meters:
+        score += 20
+        reasons.append("largest mapped footprint")
+    elif footprint_area >= largest_area_square_meters * 0.72:
+        score += 12
+        reasons.append("large mapped footprint")
+
+    distance_m = float(building.get("distance_m") or 9999)
+    envelope_span_m = max(float(envelope.get("width_m") or 0), float(envelope.get("height_m") or 0), 1.0)
+    centroid_score = _clamp(1 - (distance_m / max(envelope_span_m, 24.0)), 0.0, 1.0)
+    if centroid_score > 0:
+        score += int(round(centroid_score * 10))
+        reasons.append("close to address anchor")
+
+    if _is_primary_roof_candidate_kind(building.get("kind")):
+        score += 5
+        reasons.append("primary-use building tag")
+    else:
+        score -= 20
+        penalties.append("auxiliary structure tag")
+
+    if building.get("dominant_edge_bearing") is not None and building.get("dominant_edge_length_m"):
+        score += 5
+        reasons.append("usable roof geometry")
+
+    if match_quality == "high":
+        score += 10
+        reasons.append("high quality geocode")
+    elif match_quality == "medium":
+        score += 5
+        reasons.append("medium quality geocode")
+
+    normalized_score = int(_clamp(score, 0, 100))
+    confidence = "high" if normalized_score >= 82 else "medium" if normalized_score >= 58 else "low"
+
+    return {
+        "candidate_id": building.get("id"),
+        "building_id": building.get("id"),
+        "name": building.get("name"),
+        "kind": building.get("kind"),
+        "confidence": confidence,
+        "confidence_score": normalized_score,
+        "reasons": reasons,
+        "penalties": penalties,
+        "footprint_area_square_meters": building.get("footprint_area_square_meters"),
+        "footprint_area_square_feet": building.get("footprint_area_square_feet"),
+        "distance_m": building.get("distance_m"),
+        "centroid": building.get("centroid"),
+        "geometry": building.get("geometry"),
+    }
+
+
+def _build_parcel_intelligence(
+    latitude: float,
+    longitude: float,
+    envelope: dict[str, Any],
+    parcel_context: dict[str, Any],
+    building_context: dict[str, Any],
+    roof_capacity_context: dict[str, Any],
+    match_quality: Optional[str],
+):
+    candidate_bounds = parcel_context.get("bounds") or envelope.get("bounds")
+    parcel_area_sq_m = _bounds_area_square_meters(candidate_bounds) if candidate_bounds else 0.0
+    parcel_geometry = _build_bounds_geometry(candidate_bounds)
+    candidate_buildings = [
+        building
+        for building in (building_context.get("nearby_buildings") or [])
+        if (building.get("footprint_area_square_meters") or 0) >= 20
+    ]
+    largest_area_square_meters = max(
+        [float(building.get("footprint_area_square_meters") or 0) for building in candidate_buildings] or [0.0]
+    )
+    scored_candidates = sorted(
+        [
+            _score_structure_candidate(
+                building,
+                largest_area_square_meters=largest_area_square_meters,
+                envelope=envelope,
+                match_quality=match_quality,
+            )
+            for building in candidate_buildings
+        ],
+        key=lambda candidate: candidate.get("confidence_score") or 0,
+        reverse=True,
+    )
+
+    preferred_id = roof_capacity_context.get("candidate_building_id")
+    primary_structure = next(
+        (candidate for candidate in scored_candidates if candidate.get("building_id") == preferred_id),
+        scored_candidates[0] if scored_candidates else None,
+    )
+    confidence_score = primary_structure.get("confidence_score") if primary_structure else 0
+    confidence = primary_structure.get("confidence") if primary_structure else "low"
+    source = (
+        "geocoder-envelope-and-openstreetmap-building-footprints"
+        if parcel_geometry
+        else "openstreetmap-building-footprints"
+    )
+
+    return {
+        "available": bool(parcel_geometry or scored_candidates),
+        "source": source,
+        "parcel": {
+            "parcel_id": None,
+            "source": envelope.get("source") or "planning-envelope",
+            "label": "Parcel candidate",
+            "certified_boundary": False,
+            "centroid": {
+                "lat": round(latitude, 6),
+                "lng": round(longitude, 6),
+            },
+            "area_square_meters": _round(parcel_area_sq_m, 1) if parcel_area_sq_m else None,
+            "area_square_feet": _round(parcel_area_sq_m * SQ_METERS_TO_SQ_FEET, 0) if parcel_area_sq_m else None,
+            "bounds": candidate_bounds,
+            "geometry": parcel_geometry,
+        },
+        "primary_structure": primary_structure,
+        "structure_candidates": scored_candidates[:6],
+        "structure_count": len(candidate_buildings),
+        "primary_structure_confidence": confidence,
+        "primary_structure_confidence_score": confidence_score,
+        "feature_coverage": {
+            "solar": {
+                "status": "ready" if roof_capacity_context.get("available") else "needs user roof drawing",
+                "summary": "Use the primary structure as the roof extraction candidate before drawn roof refinement.",
+            },
+            "garden": {
+                "status": "ready" if parcel_context.get("planning_core_bounds") else "limited",
+                "summary": "Use the parcel candidate and primary structure to place the siting core away from the street-side building.",
+            },
+            "space_weather": {
+                "status": "ready",
+                "summary": "Use the parcel candidate to label the localized property center for live sunlight and space-weather context.",
+            },
+        },
+        "summary": (
+            f"Primary structure confidence is {confidence_score}% from {source.replace('-', ' ')}."
+            if primary_structure
+            else "Parcel intelligence could not identify a primary structure from mapped footprints yet."
+        ),
+        "model_note": (
+            "This is parcel intelligence, not a certified cadastral boundary. It scores mapped building footprints "
+            "inside the address match envelope so Solar, Garden, and Space Weather share the same property identity."
+        ),
+    }
+
+
 def _build_unavailable_roof_capacity_context(summary: str):
     return {
         "available": False,
@@ -1304,6 +1498,102 @@ def _build_shade_context(
     }
 
 
+def _build_tree_canopy_context(canopy_context: dict[str, Any]):
+    nearby_canopy = list(canopy_context.get("nearby_canopy") or [])
+    directional_pressure = canopy_context.get("directional_pressure") or {}
+    strongest_direction = max(directional_pressure, key=directional_pressure.get) if directional_pressure else None
+    strongest_pressure = directional_pressure.get(strongest_direction, 0) if strongest_direction else 0
+    canopy_count = int(canopy_context.get("canopy_count") or 0)
+    nearest_canopy = canopy_context.get("nearest_canopy")
+
+    if strongest_pressure >= 0.7 or canopy_count >= 5:
+        coverage_class = "dense"
+    elif strongest_pressure >= 0.32 or canopy_count >= 2:
+        coverage_class = "mixed"
+    elif canopy_count > 0:
+        coverage_class = "light"
+    else:
+        coverage_class = "limited"
+
+    return {
+        "source": canopy_context.get("source") or "openstreetmap-overpass",
+        "canopy_count": canopy_count,
+        "coverage_class": coverage_class,
+        "nearby_canopy": nearby_canopy,
+        "nearest_canopy": nearest_canopy,
+        "directional_pressure": directional_pressure,
+        "strongest_direction": strongest_direction,
+        "strongest_pressure": _round(strongest_pressure, 2),
+        "summary": (
+            f"Tree canopy reads as {coverage_class}, strongest from the {strongest_direction} side."
+            if strongest_direction and canopy_count
+            else "No mapped tree canopy is being surfaced in this property context radius."
+        ),
+        "model_note": (
+            "Tree canopy context comes from mapped tree, wood, tree-row, scrub, orchard, and vineyard features. "
+            "It is useful for first-pass garden sunlight but is not a complete tree inventory."
+        ),
+    }
+
+
+def _build_garden_sun_context(
+    parcel_context: dict[str, Any],
+    building_context: dict[str, Any],
+    tree_canopy_context: dict[str, Any],
+    terrain_context: dict[str, Any],
+    shade_context: dict[str, Any],
+):
+    building_directional = building_context.get("directional_pressure") or {}
+    canopy_directional = tree_canopy_context.get("directional_pressure") or {}
+    directional_pressure = {}
+    for direction in ("north", "south", "east", "west"):
+        directional_pressure[direction] = _round(
+            (_safe_float(building_directional.get(direction), 0) or 0)
+            + ((_safe_float(canopy_directional.get(direction), 0) or 0) * 1.15),
+            2,
+        )
+
+    strongest_direction = max(directional_pressure, key=directional_pressure.get) if directional_pressure else None
+    strongest_pressure = directional_pressure.get(strongest_direction, 0) if strongest_direction else 0
+    shade_risk = "high" if strongest_pressure >= 1.15 else "moderate" if strongest_pressure >= 0.45 else "low"
+
+    return {
+        "available": True,
+        "source": "property-context-derived-garden-sun",
+        "shade_risk": shade_risk,
+        "open_side": parcel_context.get("open_side"),
+        "terrain_bias": shade_context.get("terrain_bias") or terrain_context.get("dominant_aspect") or "mostly neutral",
+        "terrain_limit": parcel_context.get("terrain_limit"),
+        "directional_shade_pressure": directional_pressure,
+        "strongest_shade_direction": strongest_direction,
+        "strongest_shade_pressure": _round(strongest_pressure, 2),
+        "cloud_adjustment": {
+            "status": "uses-property-climate-when-loaded",
+            "source": "open-meteo-historical-shortwave-radiation",
+            "summary": (
+                "Garden zone sunlight should be adjusted with monthly historical shortwave radiation "
+                "from property climate when that endpoint has loaded."
+            ),
+        },
+        "zone_model_inputs": [
+            "garden patch geometry",
+            "tree canopy pressure",
+            "building obstruction pressure",
+            "terrain bias",
+            "parcel siting core",
+            "historical monthly shortwave radiation",
+        ],
+        "summary": (
+            f"Garden sunlight context reads {shade_risk} shade risk, strongest from the {strongest_direction} side, "
+            f"with the {parcel_context.get('open_side') or 'unknown'} side currently most open."
+        ),
+        "model_note": (
+            "This context is designed for garden patch sunlight estimates. It combines local obstruction cues "
+            "with cloud-adjusted climate history in the frontend zone model; it is not hourly ray tracing."
+        ),
+    }
+
+
 def get_property_context_snapshot(
     latitude: float,
     longitude: float,
@@ -1329,6 +1619,23 @@ def get_property_context_snapshot(
         roof_capacity_context,
     )
     shade_context = _build_shade_context(building_context, terrain_context, canopy_context)
+    tree_canopy_context = _build_tree_canopy_context(canopy_context)
+    garden_sun_context = _build_garden_sun_context(
+        parcel_context,
+        building_context,
+        tree_canopy_context,
+        terrain_context,
+        shade_context,
+    )
+    parcel_intelligence = _build_parcel_intelligence(
+        latitude,
+        longitude,
+        envelope,
+        parcel_context,
+        building_context,
+        roof_capacity_context,
+        match_quality,
+    )
 
     summary = (
         f"{building_context.get('summary')} {canopy_context.get('summary')} {terrain_context.get('summary')} "
@@ -1336,23 +1643,29 @@ def get_property_context_snapshot(
     )
     if roof_capacity_context.get("available"):
         summary = f"{summary} {roof_capacity_context.get('summary')}"
+    if parcel_intelligence.get("available"):
+        summary = f"{summary} {parcel_intelligence.get('summary')}"
 
     return {
-        "context_version": "property-context-v3",
+        "context_version": "property-context-v4",
         "latitude": round(latitude, 6),
         "longitude": round(longitude, 6),
         "match_quality": match_quality or "unknown",
         "match_envelope": envelope,
+        "parcel_intelligence": parcel_intelligence,
         "parcel_context": parcel_context,
         "building_context": building_context,
         "canopy_context": canopy_context,
+        "tree_canopy_context": tree_canopy_context,
         "terrain_context": terrain_context,
         "shade_context": shade_context,
+        "garden_sun_context": garden_sun_context,
         "roof_capacity_context": roof_capacity_context,
         "summary": summary,
         "model_note": (
             "This context layer uses nearby OpenStreetMap building and vegetation features plus SRTM terrain samples "
-            "and a building-anchored garden planning envelope derived from the address match envelope. It still does not include "
-            "parcel-certified boundaries, fence lines, or tree-perfect canopy geometry."
+            "and a building-anchored garden planning envelope derived from the address match envelope. It now emits "
+            "shared parcel intelligence for Solar, Garden, and Space Weather, but still does not include parcel-certified "
+            "boundaries, fence lines, or tree-perfect canopy geometry."
         ),
     }

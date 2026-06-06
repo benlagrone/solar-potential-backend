@@ -70,12 +70,38 @@ class UserData(BaseModel):
     address: Address
     browserData: BrowserData
 
-class RoofSelection(BaseModel):
+class RoofPlane(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
     geometry: dict
     centroid: Optional[dict] = None
     areaSquareMeters: float
     areaSquareFeet: float
-    recommendedKw: float
+    usableAreaSquareMeters: Optional[float] = None
+    usableAreaSquareFeet: Optional[float] = None
+    setbackAreaSquareMeters: Optional[float] = None
+    setbackAreaSquareFeet: Optional[float] = None
+    setbackFeet: Optional[float] = None
+    dominantEdgeBearing: Optional[float] = None
+    dominantEdgeLengthMeters: Optional[float] = None
+    assumedAzimuth: Optional[float] = None
+    facingLabel: Optional[str] = None
+    recommendedKw: Optional[float] = None
+
+
+class RoofSelection(BaseModel):
+    geometry: Optional[dict] = None
+    centroid: Optional[dict] = None
+    areaSquareMeters: Optional[float] = None
+    areaSquareFeet: Optional[float] = None
+    usableAreaSquareMeters: Optional[float] = None
+    usableAreaSquareFeet: Optional[float] = None
+    setbackAreaSquareMeters: Optional[float] = None
+    setbackAreaSquareFeet: Optional[float] = None
+    planeCount: Optional[int] = None
+    dominantPlaneId: Optional[str] = None
+    recommendedKw: Optional[float] = None
+    planes: Optional[list[RoofPlane]] = None
 
 
 class GardenZone(BaseModel):
@@ -247,6 +273,7 @@ MONTH_DAY_COUNTS = {
 }
 ROOF_COVERAGE_FACTOR = 0.565
 EARTH_RADIUS_METERS = 6371000
+SQ_METERS_TO_SQ_FEET = 10.7639
 NREL_PVWATTS_URL = os.getenv(
     "NREL_PVWATTS_URL",
     "https://developer.nlr.gov/api/pvwatts/v8.json",
@@ -1292,6 +1319,10 @@ def get_polygon_ring_points(geometry):
     return points
 
 
+def square_meters_to_square_feet(value):
+    return float(value or 0) * SQ_METERS_TO_SQ_FEET
+
+
 def project_local_point(point, origin_latitude):
     origin_latitude_radians = math.radians(origin_latitude)
     return {
@@ -1343,8 +1374,230 @@ def resolve_dominant_roof_edge(roof_selection):
     return longest_edge
 
 
+def extract_roof_planes(roof_selection):
+    if not roof_selection:
+        return []
+
+    raw_planes = roof_selection.get("planes")
+    if not isinstance(raw_planes, list) or not raw_planes:
+        raw_planes = [roof_selection]
+
+    planes = []
+    for index, plane in enumerate(raw_planes):
+        if not isinstance(plane, dict):
+            continue
+
+        geometry = plane.get("geometry")
+        points = get_polygon_ring_points(geometry)
+        if not points:
+            continue
+
+        area_square_meters = float(
+            plane.get("areaSquareMeters")
+            or roof_selection.get("areaSquareMeters")
+            or 0
+        )
+        area_square_feet = float(
+            plane.get("areaSquareFeet")
+            or roof_selection.get("areaSquareFeet")
+            or square_meters_to_square_feet(area_square_meters)
+        )
+        usable_area_square_meters = float(
+            plane.get("usableAreaSquareMeters")
+            or roof_selection.get("usableAreaSquareMeters")
+            or area_square_meters
+        )
+        usable_area_square_feet = float(
+            plane.get("usableAreaSquareFeet")
+            or roof_selection.get("usableAreaSquareFeet")
+            or square_meters_to_square_feet(usable_area_square_meters)
+        )
+        setback_area_square_meters = max(0.0, area_square_meters - usable_area_square_meters)
+        setback_area_square_feet = max(0.0, area_square_feet - usable_area_square_feet)
+        dominant_edge = resolve_dominant_roof_edge(plane)
+
+        planes.append(
+            {
+                "id": plane.get("id") or f"roof-plane-{index + 1}",
+                "name": plane.get("name") or f"Roof plane {index + 1}",
+                "geometry": geometry,
+                "centroid": plane.get("centroid"),
+                "area_square_meters": area_square_meters,
+                "area_square_feet": area_square_feet,
+                "usable_area_square_meters": usable_area_square_meters,
+                "usable_area_square_feet": usable_area_square_feet,
+                "setback_area_square_meters": setback_area_square_meters,
+                "setback_area_square_feet": setback_area_square_feet,
+                "setback_feet": float(plane.get("setbackFeet") or 0),
+                "dominant_edge_bearing": (
+                    float(plane.get("dominantEdgeBearing"))
+                    if plane.get("dominantEdgeBearing") is not None
+                    else dominant_edge.get("bearing")
+                    if dominant_edge
+                    else None
+                ),
+                "dominant_edge_length_m": (
+                    float(plane.get("dominantEdgeLengthMeters"))
+                    if plane.get("dominantEdgeLengthMeters") is not None
+                    else dominant_edge.get("length_m")
+                    if dominant_edge
+                    else None
+                ),
+                "assumed_azimuth_hint": (
+                    float(plane.get("assumedAzimuth"))
+                    if plane.get("assumedAzimuth") is not None
+                    else None
+                ),
+                "facing_label": plane.get("facingLabel"),
+                "recommended_kw": (
+                    float(plane.get("recommendedKw"))
+                    if plane.get("recommendedKw") is not None
+                    else None
+                ),
+            }
+        )
+
+    return planes
+
+
+def select_primary_roof_plane(planes):
+    if not planes:
+        return None
+
+    return max(
+        planes,
+        key=lambda plane: (
+            float(plane.get("usable_area_square_meters") or 0),
+            float(plane.get("area_square_meters") or 0),
+        ),
+    )
+
+
+def roof_face_orientation_factor(azimuth):
+    difference = angular_distance_degrees(normalize_azimuth(azimuth or 180), 180.0)
+    return round(0.82 + (0.18 * ((180.0 - difference) / 180.0)), 3)
+
+
+def roof_tilt_alignment_factor(tilt, baseline_tilt):
+    difference = abs(float(tilt or baseline_tilt or 0) - float(baseline_tilt or 0))
+    return round(1.0 - min(difference / 100.0, 0.08), 3)
+
+
+def build_roof_plane_modeling_context(
+    plane,
+    latitude,
+    terrain_context,
+    building_context,
+    canopy_context,
+    shade_context,
+    preferred_azimuth,
+):
+    dominant_edge = None
+    if plane.get("dominant_edge_bearing") is not None:
+        dominant_edge = {
+            "bearing": float(plane.get("dominant_edge_bearing")),
+            "length_m": float(plane.get("dominant_edge_length_m") or 0),
+        }
+    else:
+        dominant_edge = resolve_dominant_roof_edge(plane)
+
+    assumed_azimuth_hint = plane.get("assumed_azimuth_hint")
+    if assumed_azimuth_hint is not None:
+        assumed_azimuth = normalize_azimuth(assumed_azimuth_hint)
+        azimuth_source = "saved roof plane orientation"
+    elif dominant_edge:
+        candidate_a = normalize_azimuth(dominant_edge["bearing"] + 90)
+        candidate_b = normalize_azimuth(dominant_edge["bearing"] - 90)
+        assumed_azimuth = (
+            candidate_a
+            if angular_distance_degrees(candidate_a, preferred_azimuth)
+            <= angular_distance_degrees(candidate_b, preferred_azimuth)
+            else candidate_b
+        )
+        azimuth_source = "roof plane dominant edge with terrain-aware side selection"
+    else:
+        assumed_azimuth = preferred_azimuth
+        azimuth_source = "terrain-aware fallback"
+
+    base_tilt = estimate_pvwatts_tilt(latitude)
+    terrain_aspect = terrain_context.get("dominant_aspect")
+    terrain_slope_percent = float(terrain_context.get("slope_percent") or 0)
+    terrain_azimuth = aspect_to_azimuth(terrain_aspect)
+    tilt_adjustment = 0.0
+    if terrain_azimuth is not None and terrain_slope_percent > 0:
+        alignment_degrees = angular_distance_degrees(assumed_azimuth, terrain_azimuth)
+        if alignment_degrees <= 45:
+            tilt_adjustment = min(terrain_slope_percent * 0.35, 5.5)
+        elif alignment_degrees >= 135:
+            tilt_adjustment = -min(terrain_slope_percent * 0.2, 3.5)
+
+    assumed_tilt = round(clamp(base_tilt + tilt_adjustment, 8, 45), 1)
+    tilt_source = (
+        "latitude baseline nudged by local terrain aspect"
+        if terrain_azimuth is not None and terrain_slope_percent > 0
+        else "latitude fallback"
+    )
+
+    directional_pressure = building_context.get("directional_pressure") or {}
+    canopy_directional_pressure = canopy_context.get("directional_pressure") or {}
+    facing_group = azimuth_to_direction_group(assumed_azimuth)
+    pressure_weights = {
+        "south": {"south": 0.75, "east": 0.18, "west": 0.18, "north": 0.05},
+        "east": {"east": 0.75, "south": 0.18, "north": 0.18, "west": 0.05},
+        "west": {"west": 0.75, "south": 0.18, "north": 0.18, "east": 0.05},
+        "north": {"north": 0.75, "east": 0.18, "west": 0.18, "south": 0.05},
+    }[facing_group]
+    weighted_building_pressure = sum(
+        float(directional_pressure.get(direction) or 0) * weight
+        for direction, weight in pressure_weights.items()
+    )
+    weighted_canopy_pressure = sum(
+        float(canopy_directional_pressure.get(direction) or 0) * weight
+        for direction, weight in pressure_weights.items()
+    )
+    building_loss_fraction = clamp(weighted_building_pressure * 0.035, 0.0, 0.12)
+    canopy_loss_fraction = clamp(weighted_canopy_pressure * 0.030, 0.0, 0.10)
+    terrain_bias = shade_context.get("terrain_bias") or "mostly neutral"
+    terrain_loss_adjustment = 0.0
+    if terrain_bias == "less solar-favored":
+        terrain_loss_adjustment = 0.02
+    elif terrain_bias == "mostly neutral":
+        terrain_loss_adjustment = 0.01
+
+    site_loss_fraction = clamp(
+        building_loss_fraction + canopy_loss_fraction + terrain_loss_adjustment,
+        0.0,
+        0.18,
+    )
+
+    return {
+        "id": plane.get("id"),
+        "name": plane.get("name"),
+        "area_square_meters": plane.get("area_square_meters"),
+        "area_square_feet": plane.get("area_square_feet"),
+        "usable_area_square_meters": plane.get("usable_area_square_meters"),
+        "usable_area_square_feet": plane.get("usable_area_square_feet"),
+        "setback_area_square_meters": plane.get("setback_area_square_meters"),
+        "setback_area_square_feet": plane.get("setback_area_square_feet"),
+        "setback_feet": plane.get("setback_feet"),
+        "dominant_edge_bearing": dominant_edge.get("bearing") if dominant_edge else None,
+        "dominant_edge_length_m": dominant_edge.get("length_m") if dominant_edge else None,
+        "assumed_azimuth": round(assumed_azimuth, 1),
+        "assumed_tilt": assumed_tilt,
+        "facing_group": facing_group,
+        "facing_label": plane.get("facing_label") or azimuth_to_direction_group(assumed_azimuth).capitalize(),
+        "azimuth_source": azimuth_source,
+        "tilt_source": tilt_source,
+        "building_pressure_score": round(weighted_building_pressure, 2),
+        "canopy_pressure_score": round(weighted_canopy_pressure, 2),
+        "modeled_site_losses_percent": round(site_loss_fraction * 100, 1),
+        "site_loss_factor": round(1 - site_loss_fraction, 3),
+        "orientation_factor": roof_face_orientation_factor(assumed_azimuth),
+        "tilt_factor": roof_tilt_alignment_factor(assumed_tilt, base_tilt),
+    }
+
+
 def build_solar_modeling_context(latitude, roof_selection, property_context):
-    dominant_edge = resolve_dominant_roof_edge(roof_selection)
     terrain_context = (property_context or {}).get("terrain_context") or {}
     building_context = (property_context or {}).get("building_context") or {}
     canopy_context = (property_context or {}).get("canopy_context") or {}
@@ -1352,6 +1605,88 @@ def build_solar_modeling_context(latitude, roof_selection, property_context):
     roof_capacity_context = (property_context or {}).get("roof_capacity_context") or {}
     terrain_aspect = terrain_context.get("dominant_aspect")
     preferred_azimuth = aspect_to_azimuth(terrain_aspect) or 180.0
+    roof_planes = extract_roof_planes(roof_selection)
+
+    if roof_planes:
+        plane_contexts = [
+            build_roof_plane_modeling_context(
+                plane,
+                latitude,
+                terrain_context,
+                building_context,
+                canopy_context,
+                shade_context,
+                preferred_azimuth,
+            )
+            for plane in roof_planes
+        ]
+        total_usable_area_square_meters = sum(
+            float(plane.get("usable_area_square_meters") or 0) for plane in plane_contexts
+        )
+        total_gross_area_square_meters = sum(
+            float(plane.get("area_square_meters") or 0) for plane in plane_contexts
+        )
+        total_setback_area_square_meters = max(
+            0.0,
+            total_gross_area_square_meters - total_usable_area_square_meters,
+        )
+        primary_plane = select_primary_roof_plane(plane_contexts) or plane_contexts[0]
+        total_weight = total_usable_area_square_meters or sum(
+            float(plane.get("area_square_meters") or 0) for plane in plane_contexts
+        ) or 1.0
+
+        def weighted_average(key):
+            return sum(
+                float(plane.get(key) or 0)
+                * (float(plane.get("usable_area_square_meters") or plane.get("area_square_meters") or 0) or 1.0)
+                for plane in plane_contexts
+            ) / total_weight
+
+        site_loss_factor = round(weighted_average("site_loss_factor"), 3)
+        modeled_site_losses_percent = round((1 - site_loss_factor) * 100, 1)
+
+        return {
+            "dominant_edge_bearing": primary_plane.get("dominant_edge_bearing"),
+            "dominant_edge_length_m": primary_plane.get("dominant_edge_length_m"),
+            "assumed_azimuth": primary_plane.get("assumed_azimuth"),
+            "assumed_tilt": round(weighted_average("assumed_tilt"), 1),
+            "azimuth_source": (
+                "multi-plane roof layout with terrain-aware side selection"
+                if len(plane_contexts) > 1
+                else primary_plane.get("azimuth_source")
+            ),
+            "tilt_source": primary_plane.get("tilt_source"),
+            "site_context_available": bool(property_context),
+            "site_context_summary": (property_context or {}).get("summary"),
+            "site_context_label": ((property_context or {}).get("match_envelope") or {}).get("label"),
+            "site_context_source": ((property_context or {}).get("match_envelope") or {}).get("source"),
+            "obstruction_risk": shade_context.get("obstruction_risk") or building_context.get("obstruction_risk"),
+            "canopy_count": canopy_context.get("canopy_count"),
+            "nearest_canopy_distance_m": (canopy_context.get("nearest_canopy") or {}).get("distance_m"),
+            "terrain_class": terrain_context.get("terrain_class"),
+            "terrain_aspect": terrain_aspect,
+            "terrain_bias": shade_context.get("terrain_bias") or "mostly neutral",
+            "building_pressure_score": round(weighted_average("building_pressure_score"), 2),
+            "canopy_pressure_score": round(weighted_average("canopy_pressure_score"), 2),
+            "roof_capacity_available": bool(roof_capacity_context.get("available")),
+            "roof_capacity_confidence": roof_capacity_context.get("confidence"),
+            "estimated_roof_area_square_feet": roof_capacity_context.get("usable_roof_area_square_feet"),
+            "estimated_roof_area_square_meters": roof_capacity_context.get("usable_roof_area_square_meters"),
+            "modeled_site_losses_percent": modeled_site_losses_percent,
+            "site_loss_factor": site_loss_factor,
+            "pvwatts_losses_percent": round(NREL_PVWATTS_DEFAULT_LOSSES + modeled_site_losses_percent, 1),
+            "roof_plane_count": len(plane_contexts),
+            "gross_roof_area_square_meters": round(total_gross_area_square_meters, 1),
+            "gross_roof_area_square_feet": round(square_meters_to_square_feet(total_gross_area_square_meters), 1),
+            "usable_roof_area_square_meters": round(total_usable_area_square_meters, 1),
+            "usable_roof_area_square_feet": round(square_meters_to_square_feet(total_usable_area_square_meters), 1),
+            "setback_area_square_meters": round(total_setback_area_square_meters, 1),
+            "setback_area_square_feet": round(square_meters_to_square_feet(total_setback_area_square_meters), 1),
+            "orientation_mix_factor": round(weighted_average("orientation_factor"), 3),
+            "roof_planes": plane_contexts,
+        }
+
+    dominant_edge = resolve_dominant_roof_edge(roof_selection)
 
     if (
         not dominant_edge
@@ -1464,6 +1799,15 @@ def build_solar_modeling_context(latitude, roof_selection, property_context):
         "modeled_site_losses_percent": round(site_loss_fraction * 100, 1),
         "site_loss_factor": round(1 - site_loss_fraction, 3),
         "pvwatts_losses_percent": round(NREL_PVWATTS_DEFAULT_LOSSES + (site_loss_fraction * 100), 1),
+        "roof_plane_count": 1 if roof_selection else 0,
+        "gross_roof_area_square_meters": roof_selection.get("areaSquareMeters") if roof_selection else None,
+        "gross_roof_area_square_feet": roof_selection.get("areaSquareFeet") if roof_selection else None,
+        "usable_roof_area_square_meters": roof_selection.get("usableAreaSquareMeters") if roof_selection else None,
+        "usable_roof_area_square_feet": roof_selection.get("usableAreaSquareFeet") if roof_selection else None,
+        "setback_area_square_meters": roof_selection.get("setbackAreaSquareMeters") if roof_selection else None,
+        "setback_area_square_feet": roof_selection.get("setbackAreaSquareFeet") if roof_selection else None,
+        "orientation_mix_factor": roof_face_orientation_factor(assumed_azimuth),
+        "roof_planes": [],
     }
 
 
@@ -1475,10 +1819,20 @@ def calculate_roof_backed_system_size(roof_selection, panel_efficiency):
     if not roof_selection:
         return None
 
-    area_square_meters = float(roof_selection.get("areaSquareMeters") or 0)
-    if area_square_meters > 0:
+    roof_planes = extract_roof_planes(roof_selection)
+    usable_area_square_meters = sum(
+        float(plane.get("usable_area_square_meters") or 0) for plane in roof_planes
+    )
+    if usable_area_square_meters <= 0:
+        usable_area_square_meters = float(
+            roof_selection.get("usableAreaSquareMeters")
+            or roof_selection.get("areaSquareMeters")
+            or 0
+        )
+
+    if usable_area_square_meters > 0:
         normalized_efficiency = normalize_panel_efficiency(panel_efficiency)
-        kw = area_square_meters * normalized_efficiency * ROOF_COVERAGE_FACTOR
+        kw = usable_area_square_meters * normalized_efficiency * ROOF_COVERAGE_FACTOR
         return round(clamp(kw, 1.5, 18.0), 2)
 
     recommended_kw = roof_selection.get("recommendedKw")
@@ -1514,13 +1868,26 @@ def resolve_solar_sizing(input_data, roof_selection, property_context):
         input_data.panel_efficiency,
     )
     if roof_size_kw:
+        roof_planes = extract_roof_planes(roof_selection)
+        gross_roof_area_square_feet = float(roof_selection.get("areaSquareFeet") or 0) if roof_selection else None
+        usable_roof_area_square_feet = float(
+            roof_selection.get("usableAreaSquareFeet")
+            or sum(float(plane.get("usable_area_square_feet") or 0) for plane in roof_planes)
+            or gross_roof_area_square_feet
+            or 0
+        )
+        roof_plane_count = len(roof_planes) or 1
         return {
             "system_size_kw": roof_size_kw,
             "sizing_source": "roof-geometry",
             "estimate_mode": "roof-backed",
-            "sizing_note": "System size is derived from the saved roof geometry and panel efficiency.",
+            "sizing_note": (
+                f"System size is derived from {roof_plane_count} saved roof plane"
+                f"{'' if roof_plane_count == 1 else 's'}, about {round(usable_roof_area_square_feet):,} sq ft "
+                "usable after setbacks, and the current panel efficiency."
+            ),
             "next_input_needed": None,
-            "roof_area_square_feet": roof_selection.get("areaSquareFeet") if roof_selection else None,
+            "roof_area_square_feet": gross_roof_area_square_feet,
             "roof_area_square_meters": roof_selection.get("areaSquareMeters") if roof_selection else None,
         }
 
@@ -1613,6 +1980,15 @@ def build_solar_production_model(
     sizing_source,
 ):
     normalized_efficiency = normalize_panel_efficiency(panel_efficiency)
+    roof_plane_layout = modeling_context.get("roof_planes") or []
+    roof_plane_layout_active = (
+        sizing_source == "roof-geometry"
+        and roof_plane_layout
+        and (
+            len(roof_plane_layout) > 1
+            or any(float(plane.get("setback_area_square_feet") or 0) > 0 for plane in roof_plane_layout)
+        )
+    )
     estimate_mode = (
         "roof-backed"
         if sizing_source == "roof-geometry"
@@ -1668,9 +2044,11 @@ def build_solar_production_model(
         "soiling": 0.97,
         "availability": 0.99,
         "temperature": resolve_temperature_factor(avg_all_sky_radiation),
-        "layout": 0.96 if roof_selection else 0.93 if sizing_source == "roof-footprint" else 0.90,
+        "layout": 0.97 if roof_plane_layout_active else 0.96 if roof_selection else 0.93 if sizing_source == "roof-footprint" else 0.90,
         "site_context": modeling_context.get("site_loss_factor", 1.0),
     }
+    if roof_plane_layout_active:
+        loss_factors["orientation_mix"] = modeling_context.get("orientation_mix_factor", 1.0)
 
     performance_ratio = 1.0
     for factor in loss_factors.values():
@@ -1679,16 +2057,64 @@ def build_solar_production_model(
 
     monthly_production = {}
     monthly_savings = {}
-    for month, radiation in monthly_all_sky.items():
-        monthly_output = round(
-            float(radiation or 0)
-            * system_size_kw
-            * performance_ratio
-            * MONTH_DAY_COUNTS.get(month, 30),
-            1,
+    if roof_plane_layout_active:
+        static_performance_ratio = (
+            loss_factors["inverter"]
+            * loss_factors["electrical"]
+            * loss_factors["soiling"]
+            * loss_factors["availability"]
+            * loss_factors["temperature"]
+            * loss_factors["layout"]
         )
-        monthly_production[month] = monthly_output
-        monthly_savings[month] = round(monthly_output * electricity_rate, 2)
+        raw_plane_system_size_kw = [
+            float(plane.get("usable_area_square_meters") or 0)
+            * normalized_efficiency
+            * ROOF_COVERAGE_FACTOR
+            for plane in roof_plane_layout
+        ]
+        raw_total_kw = sum(raw_plane_system_size_kw)
+        scaling_factor = (system_size_kw / raw_total_kw) if raw_total_kw > 0 else 1.0
+        weighted_plane_pr = 0.0
+
+        for month, radiation in monthly_all_sky.items():
+            plane_outputs = []
+            for index, plane in enumerate(roof_plane_layout):
+                plane_system_size_kw = raw_plane_system_size_kw[index] * scaling_factor
+                plane_performance_ratio = (
+                    static_performance_ratio
+                    * float(plane.get("site_loss_factor") or 1.0)
+                    * float(plane.get("orientation_factor") or 1.0)
+                    * float(plane.get("tilt_factor") or 1.0)
+                )
+                weighted_plane_pr += plane_performance_ratio * plane_system_size_kw
+                plane_outputs.append(
+                    float(radiation or 0)
+                    * plane_system_size_kw
+                    * plane_performance_ratio
+                    * MONTH_DAY_COUNTS.get(month, 30)
+                )
+
+            monthly_output = round(sum(plane_outputs), 1)
+            monthly_production[month] = monthly_output
+            monthly_savings[month] = round(monthly_output * electricity_rate, 2)
+
+        performance_ratio = round(
+            weighted_plane_pr / (system_size_kw * len(monthly_all_sky))
+            if system_size_kw and monthly_all_sky
+            else performance_ratio,
+            3,
+        )
+    else:
+        for month, radiation in monthly_all_sky.items():
+            monthly_output = round(
+                float(radiation or 0)
+                * system_size_kw
+                * performance_ratio
+                * MONTH_DAY_COUNTS.get(month, 30),
+                1,
+            )
+            monthly_production[month] = monthly_output
+            monthly_savings[month] = round(monthly_output * electricity_rate, 2)
 
     annual_production = round(sum(monthly_production.values()), 2)
     daily_production = round(annual_production / 365, 2)
@@ -1733,6 +2159,14 @@ def build_solar_production_model(
         "modeled_site_losses_percent": modeling_context.get("modeled_site_losses_percent"),
         "dominant_edge_bearing": modeling_context.get("dominant_edge_bearing"),
         "dominant_edge_length_m": modeling_context.get("dominant_edge_length_m"),
+        "roof_plane_count": modeling_context.get("roof_plane_count"),
+        "gross_roof_area_square_meters": modeling_context.get("gross_roof_area_square_meters"),
+        "gross_roof_area_square_feet": modeling_context.get("gross_roof_area_square_feet"),
+        "usable_roof_area_square_meters": modeling_context.get("usable_roof_area_square_meters"),
+        "usable_roof_area_square_feet": modeling_context.get("usable_roof_area_square_feet"),
+        "setback_area_square_meters": modeling_context.get("setback_area_square_meters"),
+        "setback_area_square_feet": modeling_context.get("setback_area_square_feet"),
+        "roof_planes": modeling_context.get("roof_planes") or [],
         "monthly_production": monthly_production,
         "monthly_savings": monthly_savings,
         "annual_production": annual_production,
@@ -1846,6 +2280,14 @@ def build_nrel_pvwatts_production_model(
         "modeled_site_losses_percent": round(float(losses or 0) - NREL_PVWATTS_DEFAULT_LOSSES, 1),
         "dominant_edge_bearing": modeling_context.get("dominant_edge_bearing"),
         "dominant_edge_length_m": modeling_context.get("dominant_edge_length_m"),
+        "roof_plane_count": modeling_context.get("roof_plane_count"),
+        "gross_roof_area_square_meters": modeling_context.get("gross_roof_area_square_meters"),
+        "gross_roof_area_square_feet": modeling_context.get("gross_roof_area_square_feet"),
+        "usable_roof_area_square_meters": modeling_context.get("usable_roof_area_square_meters"),
+        "usable_roof_area_square_feet": modeling_context.get("usable_roof_area_square_feet"),
+        "setback_area_square_meters": modeling_context.get("setback_area_square_meters"),
+        "setback_area_square_feet": modeling_context.get("setback_area_square_feet"),
+        "roof_planes": modeling_context.get("roof_planes") or [],
         "weather_data_source": (pvwatts.get("station_info") or {}).get("weather_data_source"),
         "warnings": pvwatts.get("warnings") or [],
         "monthly_production": monthly_production,
@@ -1880,12 +2322,40 @@ def build_solar_assumptions(
     sizing_note,
 ):
     normalized_efficiency = normalize_panel_efficiency(panel_efficiency)
+    roof_plane_count = int(production_model.get("roof_plane_count") or 0)
+    if roof_selection:
+        usable_roof_area_square_feet = float(
+            production_model.get("usable_roof_area_square_feet")
+            or roof_selection.get("usableAreaSquareFeet")
+            or roof_selection.get("areaSquareFeet")
+            or 0
+        )
+        gross_roof_area_square_feet = float(
+            roof_selection.get("areaSquareFeet")
+            or production_model.get("gross_roof_area_square_feet")
+            or 0
+        )
+    else:
+        usable_roof_area_square_feet = float(
+            production_model.get("usable_roof_area_square_feet")
+            or production_model.get("gross_roof_area_square_feet")
+            or 0
+        )
+        gross_roof_area_square_feet = float(
+            production_model.get("gross_roof_area_square_feet") or 0
+        )
 
     if sizing_source == "roof-geometry" and roof_selection:
         system_size_assumption = (
-            f"System size uses the saved roof selection: {system_size_kw:.1f} kW from "
-            f"{round(float(roof_selection.get('areaSquareFeet', 0))):,} sq ft, "
-            f"{normalized_efficiency * 100:.0f}% panel efficiency, and a "
+            f"System size uses {roof_plane_count or 1} saved roof plane"
+            f"{'' if (roof_plane_count or 1) == 1 else 's'}: {system_size_kw:.1f} kW from "
+            f"{round(usable_roof_area_square_feet or gross_roof_area_square_feet):,} usable sq ft"
+            + (
+                f" inside {round(gross_roof_area_square_feet):,} gross drawn sq ft"
+                if usable_roof_area_square_feet and gross_roof_area_square_feet and usable_roof_area_square_feet < gross_roof_area_square_feet
+                else ""
+            )
+            + f", {normalized_efficiency * 100:.0f}% panel efficiency, and a "
             f"{ROOF_COVERAGE_FACTOR * 100:.0f}% roof coverage allowance."
         )
     elif sizing_source == "roof-footprint":
@@ -1961,10 +2431,17 @@ def build_solar_confidence(
 ):
     score = 38
     factors = []
+    roof_plane_count = int(production_model.get("roof_plane_count") or 0)
 
     if sizing_source == "roof-geometry" and roof_selection:
         score += 22
         factors.append("System size is derived from the saved roof geometry and panel efficiency.")
+        if roof_plane_count > 1:
+            score += 4
+            factors.append("Multiple roof planes are modeled separately instead of one blended roof bucket.")
+        if float(production_model.get("setback_area_square_feet") or 0) > 0:
+            score += 2
+            factors.append("Roof setbacks reduce usable area before sizing and monthly production are calculated.")
     elif sizing_source == "roof-footprint":
         score += 18
         factors.append("System size is derived from a matched building footprint and assumed usable roof coverage.")
@@ -1981,7 +2458,10 @@ def build_solar_confidence(
         if production_model.get("site_context_available"):
             score += 6
             if sizing_source == "roof-geometry":
-                factors.append("Roof-facing inputs and site losses are refined from the drawn roof and saved property context.")
+                if roof_plane_count > 1:
+                    factors.append("Roof-facing inputs and site losses are refined plane-by-plane from the drawn roof layout and saved property context.")
+                else:
+                    factors.append("Roof-facing inputs and site losses are refined from the drawn roof and saved property context.")
             elif sizing_source == "roof-footprint":
                 factors.append("Matched building footprint, terrain, and site context refine orientation and site-loss inputs.")
             else:
@@ -2457,7 +2937,18 @@ def build_solar_estimate_response(input_data):
     has_pvwatts_profile = bool(
         ((estimate_solar_data.get("pvwatts") or {}).get("outputs") or {}).get("ac_monthly_per_kw")
     )
-    model_provider = solar_provider if solar_provider == "nrel-pvwatts" and has_pvwatts_profile else "nasa"
+    roof_plane_layout_active = (
+        sizing_source == "roof-geometry"
+        and (
+            (modeling_context.get("roof_plane_count") or 0) > 1
+            or float(modeling_context.get("setback_area_square_feet") or 0) > 0
+        )
+    )
+    model_provider = (
+        solar_provider
+        if solar_provider == "nrel-pvwatts" and has_pvwatts_profile and not roof_plane_layout_active
+        else "nasa"
+    )
 
     if model_provider == "nrel-pvwatts":
         production_model = build_nrel_pvwatts_production_model(
