@@ -78,6 +78,23 @@ def build_storms_payload():
     ]
 
 
+def build_rtsw_wind_payload():
+    return [
+        {
+            "time_tag": "2026-07-23T02:46:00",
+            "proton_density": 1.77,
+            "proton_speed": 508.85,
+            "proton_temperature": 266121,
+        },
+        {
+            "time_tag": "2026-07-24T02:43:00",
+            "proton_density": 1.32,
+            "proton_speed": 643.03,
+            "proton_temperature": 200576,
+        },
+    ]
+
+
 def build_history_flares_payload():
     return [
         {
@@ -286,7 +303,13 @@ class SpaceWeatherEndpointTests(unittest.TestCase):
     def tearDown(self):
         live_conditions._CACHE.clear()
 
-    def _fake_requests_get(self, aurora_status_code=200, flares_payload=None, storms_payload=None):
+    def _fake_requests_get(
+        self,
+        aurora_status_code=200,
+        flares_payload=None,
+        storms_payload=None,
+        solar_wind_status_code=200,
+    ):
         plasma_truncated = (
             '[["time_tag","density","speed","temperature"],'
             '["2026-04-05 14:03:00.000","0.52","535.9","117988"],'
@@ -294,6 +317,10 @@ class SpaceWeatherEndpointTests(unittest.TestCase):
         payload_by_url = {
             live_conditions.NOAA_SCALES_URL: FakeResponse(json.dumps(build_scales_payload())),
             live_conditions.NOAA_ALERTS_URL: FakeResponse(json.dumps([])),
+            live_conditions.NOAA_SOLAR_WIND_URL: FakeResponse(
+                json.dumps(build_rtsw_wind_payload()),
+                status_code=solar_wind_status_code,
+            ),
             live_conditions.NOAA_PLASMA_URL: FakeResponse(plasma_truncated),
             live_conditions.NOAA_XRAY_URL: FakeResponse(json.dumps(build_xray_payload())),
             live_conditions.NOAA_DRAP_URL: FakeResponse(build_drap_payload()),
@@ -319,7 +346,7 @@ class SpaceWeatherEndpointTests(unittest.TestCase):
 
     @patch.object(main, "get_timezone", return_value="America/Chicago")
     @patch.object(live_conditions, "get_surface_irradiance_snapshot", return_value=build_surface_snapshot())
-    def test_space_weather_endpoint_accepts_truncated_plasma_payload(
+    def test_space_weather_endpoint_reads_current_rtsw_solar_wind_payload(
         self,
         _surface_snapshot,
         _timezone,
@@ -334,7 +361,8 @@ class SpaceWeatherEndpointTests(unittest.TestCase):
         payload = response.json()
         self.assertIn("freshness", payload)
         self.assertIn("reasons", payload)
-        self.assertEqual(payload["global"]["solar_wind"]["observed_at"], "2026-04-05 14:03:00.000")
+        self.assertEqual(payload["global"]["solar_wind"]["observed_at"], "2026-07-24T02:43:00")
+        self.assertEqual(payload["global"]["solar_wind"]["speed_km_s"], 643.0)
         self.assertEqual(payload["local"]["aurora_viewline"]["reach"], "nearby-viewline")
         self.assertEqual(payload["local"]["drap"]["status"], "available")
         self.assertEqual(payload["local"]["drap"]["risk"], "moderate")
@@ -342,6 +370,28 @@ class SpaceWeatherEndpointTests(unittest.TestCase):
         self.assertEqual(payload["local"]["glotec"]["risk"], "moderate")
         self.assertTrue(any(reason["id"] == "drap" for reason in payload["reasons"]))
         self.assertTrue(any(reason["id"] == "glotec" for reason in payload["reasons"]))
+
+    @patch.object(main, "get_timezone", return_value="America/Chicago")
+    @patch.object(live_conditions, "get_surface_irradiance_snapshot", return_value=build_surface_snapshot())
+    def test_space_weather_endpoint_falls_back_to_legacy_plasma_payload(
+        self,
+        _surface_snapshot,
+        _timezone,
+    ):
+        with patch.object(
+            live_conditions.requests,
+            "get",
+            side_effect=self._fake_requests_get(solar_wind_status_code=404),
+        ):
+            response = self.client.post(
+                "/api/space-weather",
+                json={"latitude": 30.2672, "longitude": -97.7431},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["global"]["solar_wind"]["observed_at"], "2026-04-05 14:03:00.000")
+        self.assertEqual(payload["global"]["solar_wind"]["speed_km_s"], 535.9)
 
     @patch.object(main, "get_timezone", return_value="America/Chicago")
     @patch.object(live_conditions, "get_surface_irradiance_snapshot", return_value=build_surface_snapshot())

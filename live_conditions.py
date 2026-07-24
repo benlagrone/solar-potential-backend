@@ -18,6 +18,7 @@ _CACHE: dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, Any]] = {}
 
 NOAA_SCALES_URL = "https://services.swpc.noaa.gov/products/noaa-scales.json"
 NOAA_ALERTS_URL = "https://services.swpc.noaa.gov/products/alerts.json"
+NOAA_SOLAR_WIND_URL = "https://services.swpc.noaa.gov/json/rtsw/rtsw_wind_1m.json"
 NOAA_PLASMA_URL = "https://services.swpc.noaa.gov/products/solar-wind/plasma-2-hour.json"
 NOAA_XRAY_URL = "https://services.swpc.noaa.gov/json/goes/primary/xrays-1-day.json"
 NOAA_AURORA_OVATION_URL = "https://services.swpc.noaa.gov/json/ovation_aurora_latest.json"
@@ -433,6 +434,80 @@ def _extract_scale_entry(scales_payload: Any, key: str) -> dict[str, Any]:
     if not isinstance(scales_payload, dict):
         return {}
     return scales_payload.get(key) or {}
+
+
+def _fetch_solar_wind_response(*, force_refresh: bool = False):
+    last_error = None
+    for url in (NOAA_SOLAR_WIND_URL, NOAA_PLASMA_URL):
+        try:
+            return _fetch_json(
+                url,
+                ttl_seconds=60,
+                force_refresh=force_refresh,
+                return_metadata=True,
+                source_name="noaa-solar-wind",
+            )
+        except (requests.RequestException, json.JSONDecodeError) as exc:
+            last_error = exc
+            logger.warning("Solar wind upstream request failed for %s: %s", url, str(exc))
+
+    if last_error:
+        raise last_error
+    raise requests.RequestException("No solar wind source configured")
+
+
+def _extract_solar_wind_snapshot(payload: Any):
+    default_snapshot = {
+        "observed_at": None,
+        "density_p_cm3": 0.0,
+        "speed_km_s": 0.0,
+        "temperature_k": 0.0,
+    }
+
+    if not isinstance(payload, list) or not payload:
+        return default_snapshot
+
+    if isinstance(payload[0], dict):
+        rows = [row for row in payload if isinstance(row, dict) and row.get("time_tag")]
+        if not rows:
+            return default_snapshot
+        latest_row = max(rows, key=lambda row: str(row.get("time_tag") or ""))
+        return {
+            "observed_at": latest_row.get("time_tag"),
+            "density_p_cm3": round(_safe_float(latest_row.get("proton_density")), 2),
+            "speed_km_s": round(_safe_float(latest_row.get("proton_speed")), 1),
+            "temperature_k": round(_safe_float(latest_row.get("proton_temperature")), 0),
+        }
+
+    rows = payload
+    if isinstance(payload[0], list) and payload[0] and all(isinstance(value, str) for value in payload[0]):
+        headers = [str(value) for value in payload[0]]
+        rows = [
+            {headers[index]: row[index] for index in range(min(len(headers), len(row)))}
+            for row in payload[1:]
+            if isinstance(row, list)
+        ]
+        rows = [row for row in rows if row.get("time_tag")]
+        if rows:
+            latest_row = max(rows, key=lambda row: str(row.get("time_tag") or ""))
+            return {
+                "observed_at": latest_row.get("time_tag"),
+                "density_p_cm3": round(_safe_float(latest_row.get("density")), 2),
+                "speed_km_s": round(_safe_float(latest_row.get("speed")), 1),
+                "temperature_k": round(_safe_float(latest_row.get("temperature")), 0),
+            }
+
+    rows = [row for row in rows if isinstance(row, list) and row]
+    if not rows:
+        return default_snapshot
+
+    latest_row = max(rows, key=lambda row: str(row[0]) if row else "")
+    return {
+        "observed_at": latest_row[0] if len(latest_row) > 0 else None,
+        "density_p_cm3": round(_safe_float(latest_row[1]), 2) if len(latest_row) > 1 else 0.0,
+        "speed_km_s": round(_safe_float(latest_row[2]), 1) if len(latest_row) > 2 else 0.0,
+        "temperature_k": round(_safe_float(latest_row[3]), 0) if len(latest_row) > 3 else 0.0,
+    }
 
 
 def _format_xray_class(flux_value: Any) -> str:
@@ -2375,13 +2450,7 @@ def get_space_weather_snapshot(
         return_metadata=True,
         source_name="noaa-alerts",
     )
-    plasma_response = _fetch_json(
-        NOAA_PLASMA_URL,
-        ttl_seconds=60,
-        force_refresh=force_refresh,
-        return_metadata=True,
-        source_name="noaa-solar-wind",
-    )
+    plasma_response = _fetch_solar_wind_response(force_refresh=force_refresh)
     xray_response = _fetch_json(
         NOAA_XRAY_URL,
         ttl_seconds=60,
@@ -2457,13 +2526,7 @@ def get_space_weather_snapshot(
     geomagnetic_storm_scale = _format_scale(current_scale_entry.get("G"))
 
     warning_count, watch_count, alert_count, recent_headlines = _build_recent_headlines(alerts_payload)
-    plasma_row = (plasma_payload[-1] if isinstance(plasma_payload, list) and len(plasma_payload) > 1 else [])
-    solar_wind = {
-        "observed_at": plasma_row[0] if len(plasma_row) > 0 else None,
-        "density_p_cm3": round(_safe_float(plasma_row[1]), 2) if len(plasma_row) > 1 else 0.0,
-        "speed_km_s": round(_safe_float(plasma_row[2]), 1) if len(plasma_row) > 2 else 0.0,
-        "temperature_k": round(_safe_float(plasma_row[3]), 0) if len(plasma_row) > 3 else 0.0,
-    }
+    solar_wind = _extract_solar_wind_snapshot(plasma_payload)
 
     long_band_rows = []
     if isinstance(xray_payload, list):
