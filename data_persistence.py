@@ -16,6 +16,8 @@ _geocode_cache_memory = {}
 _garden_crop_catalog_memory = {}
 _property_climate_snapshot_memory = {}
 _solar_quote_lead_memory = {}
+_subscription_record_memory = {}
+_entitlement_record_memory = {}
 _UNSET = object()
 _RECENT_CACHE_DAYS = 30
 
@@ -89,6 +91,7 @@ def _initialize_db(connection):
             property_climate_json TEXT,
             roof_selection_json TEXT,
             garden_zones_json TEXT NOT NULL,
+            garden_plant_observations_json TEXT NOT NULL DEFAULT '[]',
             saved_solar_reports_json TEXT NOT NULL,
             stored_at TEXT NOT NULL
         );
@@ -154,6 +157,36 @@ def _initialize_db(connection):
 
         CREATE INDEX IF NOT EXISTS idx_solar_quote_leads_quote_id
             ON solar_quote_leads(quote_id, stored_at);
+
+        CREATE TABLE IF NOT EXISTS subscription_records (
+            subscription_id TEXT PRIMARY KEY,
+            subject_key TEXT NOT NULL,
+            plan_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            provider TEXT,
+            provider_subscription_id TEXT,
+            current_period_end TEXT,
+            subscription_json TEXT NOT NULL,
+            stored_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_subscription_records_subject
+            ON subscription_records(subject_key, status, stored_at);
+
+        CREATE TABLE IF NOT EXISTS entitlement_records (
+            entitlement_id TEXT PRIMARY KEY,
+            subject_key TEXT NOT NULL,
+            product_surface TEXT NOT NULL,
+            feature_key TEXT NOT NULL,
+            plan_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            source_subscription_id TEXT,
+            entitlement_json TEXT NOT NULL,
+            stored_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_entitlement_records_subject
+            ON entitlement_records(subject_key, product_surface, status, stored_at);
         """
     )
     columns = {
@@ -164,6 +197,11 @@ def _initialize_db(connection):
         connection.execute("ALTER TABLE property_records ADD COLUMN property_context_json TEXT")
     if "property_climate_json" not in columns:
         connection.execute("ALTER TABLE property_records ADD COLUMN property_climate_json TEXT")
+    if "garden_plant_observations_json" not in columns:
+        connection.execute(
+            "ALTER TABLE property_records "
+            "ADD COLUMN garden_plant_observations_json TEXT NOT NULL DEFAULT '[]'"
+        )
     _seed_garden_crop_catalog(connection)
     connection.commit()
 
@@ -192,6 +230,10 @@ def _build_property_record_from_row(row):
         "roof_selection": _json_load(row["roof_selection_json"]),
         "stored_at": row["stored_at"],
         "garden_zones": _json_load(row["garden_zones_json"], default=[]) or [],
+        "garden_plant_observations": _json_load(
+            row["garden_plant_observations_json"],
+            default=[],
+        ) or [],
         "saved_solar_reports": _json_load(row["saved_solar_reports_json"], default=[]) or [],
     }
 
@@ -235,6 +277,24 @@ def _remember_solar_quote_lead(payload):
         reverse=True,
     )
     _solar_quote_lead_memory[quote_id] = existing
+
+
+def _remember_subscription_record(payload):
+    subscription_id = payload.get("id")
+    if not subscription_id:
+        return
+
+    _subscription_record_memory.pop(subscription_id, None)
+    _subscription_record_memory[subscription_id] = payload
+
+
+def _remember_entitlement_record(payload):
+    entitlement_id = payload.get("id")
+    if not entitlement_id:
+        return
+
+    _entitlement_record_memory.pop(entitlement_id, None)
+    _entitlement_record_memory[entitlement_id] = payload
 
 
 def _write_garden_crop_catalog(connection, payload):
@@ -303,6 +363,96 @@ def _write_solar_quote_lead(connection, payload):
     _remember_solar_quote_lead(normalized_payload)
 
 
+def _write_subscription_record(connection, payload):
+    stored_at = payload.get("stored_at") or _reference_data_stored_at_value()
+    normalized_payload = {
+        **payload,
+        "stored_at": stored_at,
+    }
+    connection.execute(
+        """
+        INSERT INTO subscription_records (
+            subscription_id,
+            subject_key,
+            plan_id,
+            status,
+            provider,
+            provider_subscription_id,
+            current_period_end,
+            subscription_json,
+            stored_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(subscription_id) DO UPDATE SET
+            subject_key = excluded.subject_key,
+            plan_id = excluded.plan_id,
+            status = excluded.status,
+            provider = excluded.provider,
+            provider_subscription_id = excluded.provider_subscription_id,
+            current_period_end = excluded.current_period_end,
+            subscription_json = excluded.subscription_json,
+            stored_at = excluded.stored_at
+        """,
+        (
+            normalized_payload["id"],
+            normalized_payload["subject_key"],
+            normalized_payload["plan_id"],
+            normalized_payload["status"],
+            normalized_payload.get("provider"),
+            normalized_payload.get("provider_subscription_id"),
+            normalized_payload.get("current_period_end"),
+            json.dumps(normalized_payload),
+            stored_at,
+        ),
+    )
+    _remember_subscription_record(normalized_payload)
+
+
+def _write_entitlement_record(connection, payload):
+    stored_at = payload.get("stored_at") or _reference_data_stored_at_value()
+    normalized_payload = {
+        **payload,
+        "stored_at": stored_at,
+    }
+    connection.execute(
+        """
+        INSERT INTO entitlement_records (
+            entitlement_id,
+            subject_key,
+            product_surface,
+            feature_key,
+            plan_id,
+            status,
+            source_subscription_id,
+            entitlement_json,
+            stored_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(entitlement_id) DO UPDATE SET
+            subject_key = excluded.subject_key,
+            product_surface = excluded.product_surface,
+            feature_key = excluded.feature_key,
+            plan_id = excluded.plan_id,
+            status = excluded.status,
+            source_subscription_id = excluded.source_subscription_id,
+            entitlement_json = excluded.entitlement_json,
+            stored_at = excluded.stored_at
+        """,
+        (
+            normalized_payload["id"],
+            normalized_payload["subject_key"],
+            normalized_payload["product_surface"],
+            normalized_payload["feature_key"],
+            normalized_payload["plan_id"],
+            normalized_payload["status"],
+            normalized_payload.get("source_subscription_id"),
+            json.dumps(normalized_payload),
+            stored_at,
+        ),
+    )
+    _remember_entitlement_record(normalized_payload)
+
+
 def _seed_garden_crop_catalog(connection):
     seed_payload = _garden_crop_catalog_seed_payload()
     row = connection.execute(
@@ -328,6 +478,7 @@ def _write_property_record(
     property_climate,
     roof_selection,
     garden_zones,
+    garden_plant_observations,
     saved_solar_reports,
 ):
     stored_at = _property_record_stored_at_value()
@@ -342,10 +493,11 @@ def _write_property_record(
             property_climate_json,
             roof_selection_json,
             garden_zones_json,
+            garden_plant_observations_json,
             saved_solar_reports_json,
             stored_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(guid) DO UPDATE SET
             address_lookup_key = excluded.address_lookup_key,
             address_json = excluded.address_json,
@@ -354,6 +506,7 @@ def _write_property_record(
             property_climate_json = excluded.property_climate_json,
             roof_selection_json = excluded.roof_selection_json,
             garden_zones_json = excluded.garden_zones_json,
+            garden_plant_observations_json = excluded.garden_plant_observations_json,
             saved_solar_reports_json = excluded.saved_solar_reports_json,
             stored_at = excluded.stored_at
         """,
@@ -366,6 +519,7 @@ def _write_property_record(
             _json_dump(property_climate),
             _json_dump(roof_selection),
             json.dumps(garden_zones or []),
+            json.dumps(garden_plant_observations or []),
             json.dumps(saved_solar_reports or []),
             stored_at,
         ),
@@ -381,6 +535,7 @@ def _write_property_record(
         "property_climate": property_climate,
         "roof_selection": roof_selection,
         "garden_zones": garden_zones or [],
+        "garden_plant_observations": garden_plant_observations or [],
         "saved_solar_reports": saved_solar_reports or [],
         "stored_at": stored_at,
     })
@@ -395,6 +550,8 @@ def reset_memory_storage():
     _garden_crop_catalog_memory.clear()
     _property_climate_snapshot_memory.clear()
     _solar_quote_lead_memory.clear()
+    _subscription_record_memory.clear()
+    _entitlement_record_memory.clear()
 
     try:
         with _connect() as connection:
@@ -405,6 +562,8 @@ def reset_memory_storage():
             connection.execute("DELETE FROM garden_crop_catalogs")
             connection.execute("DELETE FROM property_climate_snapshots")
             connection.execute("DELETE FROM solar_quote_leads")
+            connection.execute("DELETE FROM subscription_records")
+            connection.execute("DELETE FROM entitlement_records")
             connection.commit()
     except sqlite3.Error as exc:
         logger.warning("Unable to reset SQLite persistence: %s", str(exc))
@@ -561,6 +720,155 @@ def store_solar_quote_lead(payload):
     _remember_solar_quote_lead(payload)
 
 
+def store_subscription_record(payload):
+    required_fields = ("id", "subject_key", "plan_id", "status")
+    if not payload or any(not payload.get(field) for field in required_fields):
+        return
+
+    try:
+        with _connect() as connection:
+            _write_subscription_record(connection, payload)
+            connection.commit()
+        return
+    except sqlite3.Error as exc:
+        logger.warning("Subscription persistence fell back to memory: %s", str(exc))
+
+    stored_at = payload.get("stored_at") or _reference_data_stored_at_value()
+    _remember_subscription_record({
+        **payload,
+        "stored_at": stored_at,
+    })
+
+
+def get_subscription_record(subscription_id):
+    if not subscription_id:
+        return None
+
+    try:
+        with _connect() as connection:
+            row = connection.execute(
+                """
+                SELECT subscription_json
+                FROM subscription_records
+                WHERE subscription_id = ?
+                """,
+                (subscription_id,),
+            ).fetchone()
+        if row:
+            payload = _json_load(row["subscription_json"], default={}) or {}
+            if payload:
+                _remember_subscription_record(payload)
+                return payload
+    except sqlite3.Error as exc:
+        logger.warning("Subscription lookup fell back to memory: %s", str(exc))
+
+    return _subscription_record_memory.get(subscription_id)
+
+
+def list_subscription_records(subject_key=None, status=None):
+    try:
+        with _connect() as connection:
+            query = """
+                SELECT subscription_json
+                FROM subscription_records
+            """
+            filters = []
+            parameters = []
+            if subject_key:
+                filters.append("subject_key = ?")
+                parameters.append(subject_key)
+            if status:
+                filters.append("status = ?")
+                parameters.append(status)
+            if filters:
+                query += " WHERE " + " AND ".join(filters)
+            query += " ORDER BY stored_at DESC"
+            rows = connection.execute(query, parameters).fetchall()
+        payloads = [_json_load(row["subscription_json"], default={}) or {} for row in rows]
+        payloads = [payload for payload in payloads if payload]
+        for payload in payloads:
+            _remember_subscription_record(payload)
+        return payloads
+    except sqlite3.Error as exc:
+        logger.warning("Subscription listing fell back to memory: %s", str(exc))
+
+    records = list(_subscription_record_memory.values())
+    if subject_key:
+        records = [record for record in records if record.get("subject_key") == subject_key]
+    if status:
+        records = [record for record in records if record.get("status") == status]
+    return sorted(records, key=lambda record: str(record.get("stored_at") or ""), reverse=True)
+
+
+def store_entitlement_record(payload):
+    required_fields = (
+        "id",
+        "subject_key",
+        "product_surface",
+        "feature_key",
+        "plan_id",
+        "status",
+    )
+    if not payload or any(not payload.get(field) for field in required_fields):
+        return
+
+    try:
+        with _connect() as connection:
+            _write_entitlement_record(connection, payload)
+            connection.commit()
+        return
+    except sqlite3.Error as exc:
+        logger.warning("Entitlement persistence fell back to memory: %s", str(exc))
+
+    stored_at = payload.get("stored_at") or _reference_data_stored_at_value()
+    _remember_entitlement_record({
+        **payload,
+        "stored_at": stored_at,
+    })
+
+
+def list_entitlement_records(subject_key, product_surface=None, active_only=False):
+    if not subject_key:
+        return []
+
+    try:
+        with _connect() as connection:
+            query = """
+                SELECT entitlement_json
+                FROM entitlement_records
+                WHERE subject_key = ?
+            """
+            parameters = [subject_key]
+            if product_surface:
+                query += " AND product_surface = ?"
+                parameters.append(product_surface)
+            if active_only:
+                query += " AND status = ?"
+                parameters.append("active")
+            query += " ORDER BY stored_at DESC"
+            rows = connection.execute(query, parameters).fetchall()
+        payloads = [_json_load(row["entitlement_json"], default={}) or {} for row in rows]
+        payloads = [payload for payload in payloads if payload]
+        for payload in payloads:
+            _remember_entitlement_record(payload)
+        return payloads
+    except sqlite3.Error as exc:
+        logger.warning("Entitlement listing fell back to memory: %s", str(exc))
+
+    records = [
+        record
+        for record in _entitlement_record_memory.values()
+        if record.get("subject_key") == subject_key
+    ]
+    if product_surface:
+        records = [
+            record for record in records if record.get("product_surface") == product_surface
+        ]
+    if active_only:
+        records = [record for record in records if record.get("status") == "active"]
+    return sorted(records, key=lambda record: str(record.get("stored_at") or ""), reverse=True)
+
+
 def find_solar_quote(quote_id):
     if not quote_id:
         return None
@@ -609,6 +917,7 @@ def store_personal_info(guid, address):
                 existing_record.get("property_climate"),
                 existing_record.get("roof_selection"),
                 existing_record.get("garden_zones") or [],
+                existing_record.get("garden_plant_observations") or [],
                 existing_record.get("saved_solar_reports") or [],
             )
         return
@@ -625,6 +934,9 @@ def store_personal_info(guid, address):
         "property_climate": existing_record.get("property_climate"),
         "roof_selection": existing_record.get("roof_selection"),
         "garden_zones": existing_record.get("garden_zones") or [],
+        "garden_plant_observations": (
+            existing_record.get("garden_plant_observations") or []
+        ),
         "saved_solar_reports": existing_record.get("saved_solar_reports") or [],
         "stored_at": stored_at,
     })
@@ -638,6 +950,7 @@ def upsert_property_record(
     property_climate=_UNSET,
     roof_selection=None,
     garden_zones=_UNSET,
+    garden_plant_observations=_UNSET,
     saved_solar_reports=_UNSET,
 ):
     existing_record = get_property_record(guid) or {}
@@ -653,6 +966,12 @@ def upsert_property_record(
         garden_zones_to_store = existing_record.get("garden_zones") or []
     else:
         garden_zones_to_store = garden_zones or []
+    if garden_plant_observations is _UNSET:
+        garden_plant_observations_to_store = (
+            existing_record.get("garden_plant_observations") or []
+        )
+    else:
+        garden_plant_observations_to_store = garden_plant_observations or []
 
     if saved_solar_reports is _UNSET:
         saved_solar_reports_to_store = existing_record.get("saved_solar_reports") or []
@@ -670,6 +989,7 @@ def upsert_property_record(
                 property_climate_to_store,
                 roof_selection,
                 garden_zones_to_store,
+                garden_plant_observations_to_store,
                 saved_solar_reports_to_store,
             )
         return
@@ -686,6 +1006,7 @@ def upsert_property_record(
         "property_climate": property_climate_to_store,
         "roof_selection": roof_selection,
         "garden_zones": garden_zones_to_store,
+        "garden_plant_observations": garden_plant_observations_to_store,
         "saved_solar_reports": saved_solar_reports_to_store,
         "stored_at": stored_at,
     })

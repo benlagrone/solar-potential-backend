@@ -160,6 +160,27 @@ def build_garden_zones():
     return [build_garden_zone(1), build_garden_zone(2)]
 
 
+def build_garden_plant_observation(index=1):
+    return {
+        "id": f"garden-observation-{index}",
+        "cropId": "nasturtium" if index == 1 else "zinnia",
+        "cropName": "Nasturtiums" if index == 1 else "Zinnias",
+        "identificationConfidence": "likely" if index == 1 else "confirmed",
+        "status": "tentative" if index == 1 else "confirmed",
+        "zoneId": f"garden-zone-{index}",
+        "zoneName": f"Garden zone {index}",
+        "notes": "Photo reviewed under neutral daylight.",
+        "photoCount": 2,
+        "observedTraits": {
+            "growthHabit": "trailing-or-mounded" if index == 1 else "upright",
+            "leafShape": "round-peltate" if index == 1 else "pointed",
+            "leafArrangement": "alternate" if index == 1 else "opposite",
+        },
+        "identificationScore": 75,
+        "observedAt": f"2026-07-{18 + index}T14:00:00.000Z",
+    }
+
+
 def build_property_context(include_roof_capacity=False):
     context = {
         "context_version": "property-context-v3",
@@ -559,6 +580,51 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertEqual(record["garden_zones"][1]["id"], "garden-zone-2")
         self.assertEqual(record["garden_zones"][0]["careCadenceId"], "daily-check")
 
+    def test_property_record_endpoint_persists_garden_plant_observations(self):
+        observations = [
+            build_garden_plant_observation(1),
+            build_garden_plant_observation(2),
+        ]
+        response = self.client.post(
+            "/api/property-record",
+            json={
+                "address": build_address(),
+                "property_preview": build_property_preview(),
+                "garden_zones": build_garden_zones(),
+                "garden_plant_observations": observations,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(len(payload["garden_plant_observations"]), 2)
+        self.assertEqual(
+            payload["garden_plant_observations"][0]["cropId"],
+            "nasturtium",
+        )
+        self.assertEqual(
+            payload["garden_plant_observations"][1]["status"],
+            "confirmed",
+        )
+        self.assertEqual(
+            payload["garden_plant_observations"][0]["observedTraits"]["leafShape"],
+            "round-peltate",
+        )
+        self.assertEqual(
+            payload["garden_plant_observations"][1]["identificationScore"],
+            75,
+        )
+
+        record = data_persistence.get_property_record(payload["guid"])
+        self.assertEqual(
+            record["garden_plant_observations"][0]["zoneId"],
+            "garden-zone-1",
+        )
+        self.assertEqual(
+            record["garden_plant_observations"][1]["observedTraits"]["leafArrangement"],
+            "opposite",
+        )
+
     def test_property_record_endpoint_persists_property_context(self):
         response = self.client.post(
             "/api/property-record",
@@ -637,6 +703,36 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertEqual(record["roof_selection"]["recommendedKw"], 10.5)
         self.assertEqual(len(record["garden_zones"]), 2)
         self.assertEqual(record["garden_zones"][1]["zonePurposeId"], "perennial-border")
+
+    def test_property_record_endpoint_preserves_plant_observations_when_updating_roof(self):
+        first_response = self.client.post(
+            "/api/property-record",
+            json={
+                "address": build_address(),
+                "property_preview": build_property_preview(),
+                "garden_zones": build_garden_zones(),
+                "garden_plant_observations": [build_garden_plant_observation(1)],
+            },
+        )
+        guid = first_response.json()["guid"]
+
+        second_response = self.client.post(
+            "/api/property-record",
+            json={
+                "guid": guid,
+                "address": build_address(),
+                "property_preview": build_property_preview(),
+                "roof_selection": build_roof_selection(),
+            },
+        )
+
+        self.assertEqual(second_response.status_code, 200)
+        payload = second_response.json()
+        self.assertEqual(len(payload["garden_plant_observations"]), 1)
+        self.assertEqual(
+            payload["garden_plant_observations"][0]["cropName"],
+            "Nasturtiums",
+        )
 
     def test_find_property_record_returns_saved_garden_zones_by_address(self):
         property_response = self.client.post(
@@ -1323,6 +1419,113 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertEqual(public_quote_payload["quote"]["lead_capture"]["latest_status"], "queued")
         self.assertEqual(public_quote_payload["report"]["homeowner_quote"]["lead_capture"]["lead_count"], 1)
 
+    def test_garden_buddy_plus_subscription_entitlements_round_trip(self):
+        subject_key = "property:demo-guid"
+        subscription = {
+            "id": "sub-garden-plus-demo",
+            "subject_key": subject_key,
+            "plan_id": "garden-buddy-plus",
+            "status": "active",
+            "provider": "manual",
+            "provider_subscription_id": None,
+            "current_period_end": "2027-07-23T00:00:00Z",
+            "started_at": "2026-07-23T00:00:00Z",
+        }
+        data_persistence.store_subscription_record(subscription)
+        data_persistence.store_entitlement_record({
+            "id": "ent-plus-saved-plans",
+            "subject_key": subject_key,
+            "product_surface": "garden-buddy",
+            "feature_key": "unlimited-main-property-saved-plans",
+            "plan_id": "garden-buddy-plus",
+            "status": "active",
+            "source_subscription_id": subscription["id"],
+        })
+        data_persistence.store_entitlement_record({
+            "id": "ent-plus-exports",
+            "subject_key": subject_key,
+            "product_surface": "garden-buddy",
+            "feature_key": "printable-plan-export",
+            "plan_id": "garden-buddy-plus",
+            "status": "active",
+            "source_subscription_id": subscription["id"],
+        })
+        data_persistence.store_entitlement_record({
+            "id": "ent-plus-pro-client-workspace",
+            "subject_key": subject_key,
+            "product_surface": "garden-buddy",
+            "feature_key": "client-workspace",
+            "plan_id": "garden-buddy-pro",
+            "status": "inactive",
+            "source_subscription_id": subscription["id"],
+        })
+
+        stored_subscription = data_persistence.get_subscription_record(subscription["id"])
+        self.assertEqual(stored_subscription["plan_id"], "garden-buddy-plus")
+        self.assertEqual(stored_subscription["status"], "active")
+
+        subscriptions = data_persistence.list_subscription_records(
+            subject_key=subject_key,
+            status="active",
+        )
+        self.assertEqual(len(subscriptions), 1)
+        self.assertEqual(subscriptions[0]["id"], subscription["id"])
+
+        active_entitlements = data_persistence.list_entitlement_records(
+            subject_key,
+            product_surface="garden-buddy",
+            active_only=True,
+        )
+        self.assertEqual(
+            {entitlement["feature_key"] for entitlement in active_entitlements},
+            {
+                "printable-plan-export",
+                "unlimited-main-property-saved-plans",
+            },
+        )
+
+    def test_garden_buddy_pro_subscription_update_replaces_existing_record(self):
+        subject_key = "account:garden-coach-demo"
+        subscription_id = "sub-garden-pro-demo"
+        data_persistence.store_subscription_record({
+            "id": subscription_id,
+            "subject_key": subject_key,
+            "plan_id": "garden-buddy-pro",
+            "status": "trialing",
+            "provider": "manual",
+            "current_period_end": "2026-08-23T00:00:00Z",
+        })
+        data_persistence.store_subscription_record({
+            "id": subscription_id,
+            "subject_key": subject_key,
+            "plan_id": "garden-buddy-pro",
+            "status": "active",
+            "provider": "manual",
+            "current_period_end": "2027-07-23T00:00:00Z",
+        })
+        data_persistence.store_entitlement_record({
+            "id": "ent-pro-multi-property",
+            "subject_key": subject_key,
+            "product_surface": "garden-buddy",
+            "feature_key": "multi-property-client-planning",
+            "plan_id": "garden-buddy-pro",
+            "status": "active",
+            "source_subscription_id": subscription_id,
+        })
+
+        stored_subscription = data_persistence.get_subscription_record(subscription_id)
+        self.assertEqual(stored_subscription["status"], "active")
+        self.assertEqual(
+            stored_subscription["current_period_end"],
+            "2027-07-23T00:00:00Z",
+        )
+
+        subscriptions = data_persistence.list_subscription_records(subject_key=subject_key)
+        self.assertEqual(len(subscriptions), 1)
+        self.assertEqual(subscriptions[0]["id"], subscription_id)
+        entitlements = data_persistence.list_entitlement_records(subject_key, active_only=True)
+        self.assertEqual(entitlements[0]["feature_key"], "multi-property-client-planning")
+
     def test_property_climate_endpoint_returns_snapshot(self):
         climate_snapshot = build_property_climate()
 
@@ -1372,10 +1575,13 @@ class PropertyRecordTests(unittest.TestCase):
 
         self.assertIsNotNone(payload)
         self.assertEqual(payload["catalog_id"], "default")
-        self.assertEqual(payload["version"], "2026-04-03")
+        self.assertEqual(payload["version"], "2026-07-19")
         self.assertTrue(payload["stored_at"])
         self.assertGreater(len(payload["crops"]), 20)
         self.assertTrue(any(crop["id"] == "tomato" for crop in payload["crops"]))
+        self.assertTrue(any(crop["id"] == "zinnia" for crop in payload["crops"]))
+        self.assertTrue(any(crop["id"] == "nasturtium" for crop in payload["crops"]))
+        self.assertTrue(any(crop["id"] == "morning-glory" for crop in payload["crops"]))
         self.assertTrue(any(source["id"] == "usda-hardiness-map" for source in payload["source_basis"]))
 
     def test_garden_crop_catalog_endpoint_returns_persisted_catalog(self):
@@ -1384,10 +1590,12 @@ class PropertyRecordTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["catalog_id"], "default")
-        self.assertEqual(payload["version"], "2026-04-03")
+        self.assertEqual(payload["version"], "2026-07-19")
         self.assertGreater(len(payload["crops"]), 20)
         tomato = next(crop for crop in payload["crops"] if crop["id"] == "tomato")
         self.assertEqual(tomato["sun"]["primary"], ["full-sun"])
+        morning_glory = next(crop for crop in payload["crops"] if crop["id"] == "morning-glory")
+        self.assertEqual(morning_glory["placement"]["preferredEdge"], "north-edge")
 
     def test_property_context_endpoint_returns_snapshot(self):
         context_snapshot = build_property_context()

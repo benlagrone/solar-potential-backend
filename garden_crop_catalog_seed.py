@@ -85,6 +85,21 @@ PLANTING_DATA_SOURCES = [
         "label": "University of Minnesota Extension: Growing herbs in home gardens",
         "url": "https://extension.umn.edu/vegetables/growing-herbs",
     },
+    {
+        "id": "tamu-seasonal-color",
+        "label": "Texas A&M AgriLife Extension: Seasonal color care and management",
+        "url": "https://aggie-horticulture.tamu.edu/earthkind/landscape/seasonal-color/",
+    },
+    {
+        "id": "illinois-nasturtium",
+        "label": "University of Illinois Extension: Nasturtium",
+        "url": "https://extension.illinois.edu/herbs/nasturtium",
+    },
+    {
+        "id": "illinois-morning-glory",
+        "label": "University of Illinois Extension: Morning glory",
+        "url": "https://extension.illinois.edu/flowers/morning-glory",
+    },
 ]
 
 
@@ -161,6 +176,19 @@ CROP_CATALOG = [
                 "Late sowings work best where fall stays warm longer.",
                 ["middle", "warm"],
             ),
+        },
+        "identification": {
+            "photoCues": [
+                "broad seed leaves followed by rough, lobed true leaves",
+                "trailing or climbing stem that develops curling tendrils",
+            ],
+            "lookAlikes": ["melon", "squash", "other young cucurbits"],
+            "traits": {
+                "growthHabit": "climbing-or-trailing",
+                "leafShape": "broad-lobed",
+                "leafArrangement": "alternate",
+                "flowerShape": "yellow-five-petaled",
+            },
         },
         "sourceIds": ["umn-planting-garden", "vt-vegetable-guide", "uga-siting-garden"],
     },
@@ -810,12 +838,124 @@ CROP_CATALOG = [
         },
         "sourceIds": ["usda-hardiness-map", "uga-siting-garden"],
     },
+    {
+        "id": "zinnia",
+        "name": "Zinnias",
+        "category": "flower",
+        "lifecycle": "annual",
+        "heatProfile": "hot-season",
+        "sun": {
+            "primary": ["full-sun"],
+            "secondary": ["part-sun"],
+        },
+        "seasonalFit": {
+            "spring": fit(2, "Set out after frost once the soil is warm."),
+            "summer": fit(3, "Use a hot, bright, well-drained bed for the strongest flowering."),
+            "fall": fit(1, "Late rounds need enough warm weather left to flower.", ["warm"]),
+        },
+        "identification": {
+            "photoCues": [
+                "upright stem with opposite, pointed leaves",
+                "single daisy-like flower head at the stem tip",
+            ],
+            "lookAlikes": ["sunflower", "cosmos", "other composite flowers"],
+            "traits": {
+                "growthHabit": "upright",
+                "leafShape": "pointed",
+                "leafArrangement": "opposite",
+                "flowerShape": "daisy-like",
+            },
+        },
+        "placement": {
+            "habit": "upright",
+            "minimumAreaSquareFeet": 4,
+            "preferredEdge": "open-center",
+            "support": "Stake tall or leggy starts where wind can reach them.",
+        },
+        "sourceIds": ["tamu-seasonal-color"],
+    },
+    {
+        "id": "nasturtium",
+        "name": "Nasturtiums",
+        "category": "edible-flower",
+        "lifecycle": "annual",
+        "heatProfile": "cool-season",
+        "sun": {
+            "primary": ["part-sun"],
+            "secondary": ["full-sun", "part-shade"],
+        },
+        "seasonalFit": {
+            "spring": fit(3, "Plant into well-drained soil before the strongest heat arrives."),
+            "summer": fit(
+                1,
+                "Use morning sun and afternoon relief where summers are hot.",
+                ["middle", "warm"],
+            ),
+            "fall": fit(3, "A strong cool-season flower and edible edge after summer heat eases."),
+        },
+        "identification": {
+            "photoCues": [
+                "round water-lily-like leaves with the stalk attached near the center",
+                "five-petaled flowers held above trailing or mounded foliage",
+            ],
+            "lookAlikes": ["pennywort", "mallow", "young geranium"],
+            "traits": {
+                "growthHabit": "trailing-or-mounded",
+                "leafShape": "round-peltate",
+                "leafArrangement": "alternate",
+                "flowerShape": "five-petaled",
+            },
+        },
+        "placement": {
+            "habit": "trailing-or-mounded",
+            "minimumAreaSquareFeet": 4,
+            "preferredEdge": "bed-edge",
+            "support": "Let trailing types spill over a bed edge or low support.",
+        },
+        "sourceIds": ["illinois-nasturtium"],
+    },
+    {
+        "id": "morning-glory",
+        "name": "Morning glories",
+        "category": "ornamental-vine",
+        "lifecycle": "annual",
+        "heatProfile": "warm-season",
+        "sun": {
+            "primary": ["full-sun"],
+            "secondary": ["part-sun"],
+        },
+        "seasonalFit": {
+            "spring": fit(2, "Plant after frost beside a support it can climb immediately."),
+            "summer": fit(3, "Give the vine strong sun and vertical support while containing seed spread."),
+            "fall": fit(1, "Late planting is only useful where the warm season remains long.", ["warm"]),
+        },
+        "identification": {
+            "photoCues": [
+                "twining vine with alternate heart-shaped leaves",
+                "funnel-shaped flowers when mature",
+            ],
+            "lookAlikes": ["moonflower", "sweet potato vine", "bindweed"],
+            "traits": {
+                "growthHabit": "twining-vine",
+                "leafShape": "heart-shaped",
+                "leafArrangement": "alternate",
+                "flowerShape": "funnel-shaped",
+            },
+        },
+        "placement": {
+            "habit": "twining-vine",
+            "minimumAreaSquareFeet": 4,
+            "preferredEdge": "north-edge",
+            "support": "Use a managed trellis and remove seed pods if self-seeding is unwanted.",
+        },
+        "sourceIds": ["illinois-morning-glory"],
+    },
 ]
 
 
 GARDEN_CROP_CATALOG_SEED = {
     "catalog_id": "default",
-    "version": "2026-04-03",
+    "version": "2026-07-19",
     "model_note": (
         "USDA hardiness is useful for crop type and perennial survival, but exact sowing and "
         "transplant dates still require local frost and soil-temperature calibration."

@@ -116,6 +116,21 @@ class GardenZone(BaseModel):
     careCadenceId: Optional[str] = None
 
 
+class GardenPlantObservation(BaseModel):
+    id: str
+    cropId: str
+    cropName: str
+    identificationConfidence: str
+    status: str
+    zoneId: Optional[str] = None
+    zoneName: Optional[str] = None
+    notes: Optional[str] = None
+    photoCount: int = 0
+    observedTraits: Optional[dict[str, str]] = None
+    identificationScore: Optional[int] = None
+    observedAt: str
+
+
 class PreviewBounds(BaseModel):
     south: float
     north: float
@@ -131,6 +146,7 @@ class PropertyRecordRequest(BaseModel):
     property_climate: Optional[dict] = None
     roof_selection: Optional[RoofSelection] = None
     garden_zones: Optional[list[GardenZone]] = None
+    garden_plant_observations: Optional[list[GardenPlantObservation]] = None
 
 
 class PropertyRecordRecentRequest(BaseModel):
@@ -3103,6 +3119,11 @@ def save_property_record(payload: PropertyRecordRequest):
         if payload.garden_zones is not None
         else None
     )
+    garden_plant_observations = (
+        [observation.model_dump() for observation in payload.garden_plant_observations]
+        if payload.garden_plant_observations is not None
+        else None
+    )
 
     upsert_kwargs = {
         "property_preview": property_preview,
@@ -3112,6 +3133,8 @@ def save_property_record(payload: PropertyRecordRequest):
     }
     if garden_zones is not None:
         upsert_kwargs["garden_zones"] = garden_zones
+    if garden_plant_observations is not None:
+        upsert_kwargs["garden_plant_observations"] = garden_plant_observations
 
     upsert_property_record(guid, address, **upsert_kwargs)
     saved_record = get_property_record(guid) or {}
@@ -3124,6 +3147,10 @@ def save_property_record(payload: PropertyRecordRequest):
         "property_climate": saved_record.get("property_climate", payload.property_climate),
         "roof_selection": saved_record.get("roof_selection", roof_selection),
         "garden_zones": saved_record.get("garden_zones", garden_zones or []),
+        "garden_plant_observations": saved_record.get(
+            "garden_plant_observations",
+            garden_plant_observations or [],
+        ),
         "saved_solar_reports": saved_record.get("saved_solar_reports", []),
         "stored_at": saved_record.get("stored_at"),
     }
