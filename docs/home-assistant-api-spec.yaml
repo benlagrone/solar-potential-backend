@@ -1,0 +1,335 @@
+openapi: 3.1.0
+info:
+  title: Solar Buddy Home Assistant API
+  version: 1.0.0
+  description: >-
+    Read-only API contract for importing Solar Buddy irradiance, cloud cover,
+    geometric sun position, and localized space-weather data into Home Assistant.
+paths:
+  /api/home-assistant/snapshot:
+    get:
+      operationId: getHomeAssistantSnapshot
+      summary: Get the current Solar Buddy snapshot
+      description: >-
+        Returns a compact snapshot for Home Assistant REST sensors. Clients should
+        normally poll no more frequently than every 300 seconds. A component-level
+        upstream failure is represented in a successful response with status partial
+        or unavailable rather than discarding data from components that remain available.
+      security:
+        - HomeAssistantApiKey: []
+      parameters:
+        - name: latitude
+          in: query
+          required: true
+          description: Latitude in decimal degrees.
+          schema:
+            type: number
+            minimum: -90
+            maximum: 90
+        - name: longitude
+          in: query
+          required: true
+          description: Longitude in decimal degrees.
+          schema:
+            type: number
+            minimum: -180
+            maximum: 180
+        - name: guid
+          in: query
+          required: false
+          description: >-
+            Optional Solar Buddy property-record identifier. When found, saved property
+            context can refine the surface-irradiance calculation.
+          schema:
+            type: string
+        - name: force_refresh
+          in: query
+          required: false
+          description: Bypass eligible cached upstream observations.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Snapshot returned, including component availability details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HomeAssistantSnapshot"
+              example:
+                status: ok
+                available: true
+                observed_at: "2026-09-06T12:00:00Z"
+                location:
+                  latitude: 30.2672
+                  longitude: -97.7431
+                  time_zone: America/Chicago
+                surface_irradiance:
+                  available: true
+                  observed_at: "2026-09-06T12:00:00Z"
+                  is_daylight: true
+                  ghi_w_m2: 642.4
+                  dni_w_m2: 811.7
+                  cloud_cover_percent: 18
+                  intensity_level: high
+                  spike_level: normal
+                  next_peak_time: "2026-09-06T18:00:00Z"
+                  next_peak_ghi_w_m2: 850.2
+                  summary: Strong surface irradiance is available.
+                  freshness_status: fresh
+                sun_position:
+                  available: true
+                  calculated_at: "2026-09-06T12:00:00Z"
+                  azimuth_degrees: 104.25
+                  elevation_degrees: 31.5
+                  zenith_degrees: 58.5
+                  hour_angle_degrees: -42.8
+                  declination_degrees: 6.1
+                  above_horizon: true
+                  method: noaa-geometric-v1
+                space_weather:
+                  available: true
+                  observed_at: "2026-09-06T12:00:00Z"
+                  alert_level: quiet
+                  radio_blackout_scale: 0
+                  radiation_storm_scale: 0
+                  geomagnetic_storm_scale: 0
+                  solar_wind_speed_km_s: 420.5
+                  aurora_visibility_potential: low
+                  hf_radio_risk: low
+                  gnss_risk: low
+                  alert_count: 0
+                  watch_count: 0
+                  warning_count: 0
+                  summary: No significant space-weather impacts are active.
+                  freshness_status: fresh
+                components:
+                  surface_irradiance: available
+                  space_weather: available
+                errors: {}
+        "401":
+          description: The X-API-Key header is missing or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                detail: Invalid API key
+        "422":
+          description: One or more query parameters failed validation.
+        "503":
+          description: API-key authentication is not configured on the backend.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                detail: Home Assistant API access is not configured
+components:
+  securitySchemes:
+    HomeAssistantApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: >-
+        Dedicated Home Assistant credential. Store it as solar_buddy_api_key in
+        Home Assistant secrets.yaml; never include it in committed configuration.
+  schemas:
+    HomeAssistantSnapshot:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - available
+        - observed_at
+        - location
+        - surface_irradiance
+        - sun_position
+        - space_weather
+        - components
+        - errors
+      properties:
+        status:
+          type: string
+          enum: [ok, partial, unavailable]
+        available:
+          type: boolean
+          description: True when at least one data component is available.
+        observed_at:
+          $ref: "#/components/schemas/NullableDateTime"
+        location:
+          $ref: "#/components/schemas/Location"
+        surface_irradiance:
+          $ref: "#/components/schemas/SurfaceIrradiance"
+        sun_position:
+          $ref: "#/components/schemas/SunPosition"
+        space_weather:
+          $ref: "#/components/schemas/SpaceWeather"
+        components:
+          type: object
+          additionalProperties: false
+          required: [surface_irradiance, space_weather]
+          properties:
+            surface_irradiance:
+              $ref: "#/components/schemas/ComponentStatus"
+            space_weather:
+              $ref: "#/components/schemas/ComponentStatus"
+        errors:
+          type: object
+          description: Component names mapped to safe error summaries.
+          additionalProperties:
+            type: string
+    Location:
+      type: object
+      additionalProperties: false
+      required: [latitude, longitude, time_zone]
+      properties:
+        latitude:
+          type: number
+        longitude:
+          type: number
+        time_zone:
+          type: string
+    SurfaceIrradiance:
+      type: object
+      additionalProperties: false
+      required:
+        - available
+        - observed_at
+        - is_daylight
+        - ghi_w_m2
+        - dni_w_m2
+        - cloud_cover_percent
+        - intensity_level
+        - spike_level
+        - next_peak_time
+        - next_peak_ghi_w_m2
+        - summary
+        - freshness_status
+      properties:
+        available:
+          type: boolean
+        observed_at:
+          $ref: "#/components/schemas/NullableDateTime"
+        is_daylight:
+          type: [boolean, "null"]
+        ghi_w_m2:
+          type: [number, "null"]
+          description: Global horizontal irradiance in watts per square metre.
+        dni_w_m2:
+          type: [number, "null"]
+          description: Direct normal irradiance in watts per square metre.
+        cloud_cover_percent:
+          type: [number, "null"]
+          minimum: 0
+          maximum: 100
+        intensity_level:
+          type: [string, "null"]
+        spike_level:
+          type: [string, "null"]
+        next_peak_time:
+          $ref: "#/components/schemas/NullableDateTime"
+        next_peak_ghi_w_m2:
+          type: [number, "null"]
+        summary:
+          type: [string, "null"]
+        freshness_status:
+          type: [string, "null"]
+    SunPosition:
+      type: object
+      additionalProperties: false
+      required:
+        - available
+        - calculated_at
+        - azimuth_degrees
+        - elevation_degrees
+        - zenith_degrees
+        - hour_angle_degrees
+        - declination_degrees
+        - above_horizon
+        - method
+      properties:
+        available:
+          type: boolean
+        calculated_at:
+          $ref: "#/components/schemas/NullableDateTime"
+        azimuth_degrees:
+          type: [number, "null"]
+          description: Clockwise degrees from true north in the range 0 through 360.
+        elevation_degrees:
+          type: [number, "null"]
+          description: Degrees above the horizon; negative values place the sun below it.
+        zenith_degrees:
+          type: [number, "null"]
+          description: Degrees from vertical, equal to 90 minus elevation.
+        hour_angle_degrees:
+          type: [number, "null"]
+        declination_degrees:
+          type: [number, "null"]
+        above_horizon:
+          type: [boolean, "null"]
+        method:
+          type: [string, "null"]
+    SpaceWeather:
+      type: object
+      additionalProperties: false
+      required:
+        - available
+        - observed_at
+        - alert_level
+        - radio_blackout_scale
+        - radiation_storm_scale
+        - geomagnetic_storm_scale
+        - solar_wind_speed_km_s
+        - aurora_visibility_potential
+        - hf_radio_risk
+        - gnss_risk
+        - alert_count
+        - watch_count
+        - warning_count
+        - summary
+        - freshness_status
+      properties:
+        available:
+          type: boolean
+        observed_at:
+          $ref: "#/components/schemas/NullableDateTime"
+        alert_level:
+          type: [string, "null"]
+        radio_blackout_scale:
+          type: [integer, string, "null"]
+        radiation_storm_scale:
+          type: [integer, string, "null"]
+        geomagnetic_storm_scale:
+          type: [integer, string, "null"]
+        solar_wind_speed_km_s:
+          type: [number, "null"]
+        aurora_visibility_potential:
+          type: [string, "null"]
+        hf_radio_risk:
+          type: [string, "null"]
+        gnss_risk:
+          type: [string, "null"]
+        alert_count:
+          type: [integer, "null"]
+        watch_count:
+          type: [integer, "null"]
+        warning_count:
+          type: [integer, "null"]
+        summary:
+          type: [string, "null"]
+        freshness_status:
+          type: [string, "null"]
+    ComponentStatus:
+      type: string
+      enum: [available, unavailable]
+    NullableDateTime:
+      type: [string, "null"]
+      format: date-time
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [detail]
+      properties:
+        detail:
+          type: string

@@ -6,6 +6,11 @@ Solar Buddy exposes a compact read-only endpoint for Home Assistant:
 GET /api/home-assistant/snapshot?latitude=<latitude>&longitude=<longitude>
 ```
 
+The versioned, machine-readable contract is
+[`home-assistant-api-spec.yaml`](home-assistant-api-spec.yaml). It defines the authentication
+scheme, request parameters, response schema, field units, component availability behavior, and
+HTTP error responses.
+
 The snapshot combines current surface irradiance, cloud cover, geometric solar position, and
 localized space weather. Solar position is calculated for the forecast feed's observation time and
 requested coordinates. It does not expose device-control, automation, property-record mutation, or
