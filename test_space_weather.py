@@ -221,7 +221,19 @@ def build_surface_snapshot():
         "current": {
             "ghi_w_m2": 0.0,
             "dni_w_m2": 0.0,
+            "cloud_cover_percent": 72.0,
             "intensity_level": "low",
+        },
+        "solar_position": {
+            "available": True,
+            "calculated_at": "2026-04-05T09:00:00-05:00",
+            "azimuth_degrees": 104.25,
+            "elevation_degrees": 31.5,
+            "zenith_degrees": 58.5,
+            "hour_angle_degrees": -48.0,
+            "declination_degrees": 6.25,
+            "above_horizon": True,
+            "method": "noaa-geometric-v1",
         },
         "trend": {
             "previous_hour_ghi_w_m2": 0.0,
@@ -270,6 +282,32 @@ def build_surface_snapshot():
     }
 
 
+def build_space_weather_snapshot():
+    return {
+        "latitude": 30.2672,
+        "longitude": -97.7431,
+        "time_zone": "America/Chicago",
+        "observed_at": "2026-04-05T14:05:00Z",
+        "global": {
+            "radio_blackout_scale": {"scale": 1},
+            "radiation_storm_scale": {"scale": 0},
+            "geomagnetic_storm_scale": {"scale": 2},
+            "solar_wind": {"speed_km_s": 643.0},
+        },
+        "local": {
+            "aurora_visibility_potential": "possible",
+            "hf_radio_risk": "low",
+            "gnss_risk": "moderate",
+        },
+        "alert_level": "watch",
+        "alert_count": 1,
+        "watch_count": 2,
+        "warning_count": 0,
+        "summary": "Geomagnetic conditions are elevated for this location.",
+        "freshness": {"status": "fresh"},
+    }
+
+
 class SpaceWeatherLogicTests(unittest.TestCase):
     def tearDown(self):
         live_conditions._CACHE.clear()
@@ -293,6 +331,54 @@ class SpaceWeatherLogicTests(unittest.TestCase):
         self.assertEqual(context["reach"], "nearby-viewline")
         self.assertEqual(context["visibility"], "possible")
         self.assertGreater(context["distance_to_viewline_km"], 0)
+
+    def test_calculate_solar_position_uses_requested_time_and_location(self):
+        position = live_conditions._calculate_solar_position(
+            30.2672,
+            -97.7431,
+            "2026-06-21T13:30",
+            "America/Chicago",
+        )
+
+        self.assertTrue(position["available"])
+        self.assertEqual(position["calculated_at"], "2026-06-21T13:30:00-05:00")
+        self.assertAlmostEqual(position["azimuth_degrees"], 175.54, places=1)
+        self.assertAlmostEqual(position["elevation_degrees"], 83.17, places=1)
+        self.assertAlmostEqual(position["zenith_degrees"], 6.83, places=1)
+        self.assertTrue(position["above_horizon"])
+
+    @patch.object(live_conditions, "_build_open_meteo_payload")
+    def test_surface_snapshot_includes_cloud_cover_and_solar_position(self, mocked_forecast):
+        mocked_forecast.return_value = {
+            "data": {
+                "timezone": "America/Chicago",
+                "current": {
+                    "time": "2026-06-21T13:30",
+                    "is_day": 1,
+                    "cloud_cover": 37,
+                    "shortwave_radiation": 812.4,
+                    "direct_normal_irradiance": 901.2,
+                },
+                "hourly": {
+                    "time": ["2026-06-21T13:00", "2026-06-21T14:00"],
+                    "cloud_cover": [35, 42],
+                    "shortwave_radiation": [800, 760],
+                    "direct_normal_irradiance": [895, 850],
+                },
+            },
+            "freshness": {},
+        }
+
+        snapshot = live_conditions.get_surface_irradiance_snapshot(
+            30.2672,
+            -97.7431,
+            "America/Chicago",
+        )
+
+        self.assertEqual(snapshot["current"]["cloud_cover_percent"], 37.0)
+        self.assertEqual(snapshot["hourly_profile"][0]["cloud_cover_percent"], 35.0)
+        self.assertAlmostEqual(snapshot["solar_position"]["azimuth_degrees"], 175.54, places=1)
+        self.assertAlmostEqual(snapshot["solar_position"]["elevation_degrees"], 83.17, places=1)
 
 
 class SpaceWeatherEndpointTests(unittest.TestCase):
@@ -414,6 +500,67 @@ class SpaceWeatherEndpointTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["local"]["aurora_viewline"]["forecast_status"], "unavailable")
         self.assertTrue(payload["freshness"]["sources"]["noaa-ovation-aurora"]["refresh_failed"])
+
+    @patch.object(main, "get_timezone", return_value="America/Chicago")
+    @patch.object(main, "get_space_weather_snapshot", return_value=build_space_weather_snapshot())
+    @patch.object(main, "get_surface_irradiance_snapshot", return_value=build_surface_snapshot())
+    def test_home_assistant_snapshot_returns_compact_sensor_values(
+        self,
+        _surface_snapshot,
+        _space_weather_snapshot,
+        _timezone,
+    ):
+        response = self.client.get(
+            "/api/home-assistant/snapshot",
+            params={"latitude": 30.2672, "longitude": -97.7431},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertTrue(payload["available"])
+        self.assertEqual(payload["surface_irradiance"]["ghi_w_m2"], 0.0)
+        self.assertEqual(payload["surface_irradiance"]["cloud_cover_percent"], 72.0)
+        self.assertEqual(payload["surface_irradiance"]["freshness_status"], "fresh")
+        self.assertEqual(payload["sun_position"]["azimuth_degrees"], 104.25)
+        self.assertEqual(payload["sun_position"]["elevation_degrees"], 31.5)
+        self.assertEqual(payload["space_weather"]["alert_level"], "watch")
+        self.assertEqual(payload["space_weather"]["geomagnetic_storm_scale"], 2)
+        self.assertEqual(payload["space_weather"]["solar_wind_speed_km_s"], 643.0)
+        self.assertEqual(payload["components"]["surface_irradiance"], "available")
+        self.assertEqual(payload["components"]["space_weather"], "available")
+        self.assertEqual(payload["errors"], {})
+
+    @patch.object(main, "get_timezone", return_value="America/Chicago")
+    @patch.object(main, "get_space_weather_snapshot", side_effect=requests.HTTPError("upstream"))
+    @patch.object(main, "get_surface_irradiance_snapshot", return_value=build_surface_snapshot())
+    def test_home_assistant_snapshot_preserves_available_component_on_partial_failure(
+        self,
+        _surface_snapshot,
+        _space_weather_snapshot,
+        _timezone,
+    ):
+        response = self.client.get(
+            "/api/home-assistant/snapshot",
+            params={"latitude": 30.2672, "longitude": -97.7431},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "partial")
+        self.assertTrue(payload["available"])
+        self.assertTrue(payload["surface_irradiance"]["available"])
+        self.assertFalse(payload["space_weather"]["available"])
+        self.assertEqual(payload["components"]["space_weather"], "unavailable")
+        self.assertIn("space_weather", payload["errors"])
+
+    def test_home_assistant_snapshot_validates_coordinates(self):
+        response = self.client.get(
+            "/api/home-assistant/snapshot",
+            params={"latitude": 91, "longitude": -97.7431},
+        )
+
+        self.assertEqual(response.status_code, 422)
 
     @patch.object(main, "get_timezone", return_value="America/Chicago")
     def test_space_weather_history_endpoint_returns_recent_donki_timeline(self, _timezone):

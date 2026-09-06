@@ -1314,6 +1314,94 @@ def _find_hour_index(times: list[str], current_time: Optional[str]) -> int:
     return max(0, len(times) - 1)
 
 
+def _calculate_solar_position(
+    latitude: float,
+    longitude: float,
+    observed_at: Optional[str],
+    time_zone_name: Optional[str],
+):
+    parsed_time = _parse_time(observed_at)
+    if not parsed_time:
+        return {
+            "available": False,
+            "calculated_at": observed_at,
+            "method": "noaa-geometric-v1",
+        }
+
+    local_time_zone = _safe_timezone(time_zone_name)
+    if parsed_time.tzinfo is None:
+        local_time = parsed_time.replace(tzinfo=local_time_zone)
+    else:
+        local_time = parsed_time.astimezone(local_time_zone)
+
+    hour = (
+        local_time.hour
+        + local_time.minute / 60
+        + local_time.second / 3600
+        + local_time.microsecond / 3_600_000_000
+    )
+    fractional_year = (2 * math.pi / 365) * (
+        local_time.timetuple().tm_yday - 1 + (hour - 12) / 24
+    )
+    equation_of_time_minutes = 229.18 * (
+        0.000075
+        + 0.001868 * math.cos(fractional_year)
+        - 0.032077 * math.sin(fractional_year)
+        - 0.014615 * math.cos(2 * fractional_year)
+        - 0.040849 * math.sin(2 * fractional_year)
+    )
+    solar_declination_radians = (
+        0.006918
+        - 0.399912 * math.cos(fractional_year)
+        + 0.070257 * math.sin(fractional_year)
+        - 0.006758 * math.cos(2 * fractional_year)
+        + 0.000907 * math.sin(2 * fractional_year)
+        - 0.002697 * math.cos(3 * fractional_year)
+        + 0.00148 * math.sin(3 * fractional_year)
+    )
+    utc_offset_minutes = (local_time.utcoffset() or timedelta()).total_seconds() / 60
+    time_offset_minutes = equation_of_time_minutes + 4 * longitude - utc_offset_minutes
+    true_solar_time_minutes = (hour * 60 + time_offset_minutes) % 1440
+    hour_angle_degrees = true_solar_time_minutes / 4 - 180
+    if hour_angle_degrees < -180:
+        hour_angle_degrees += 360
+
+    latitude_radians = math.radians(latitude)
+    hour_angle_radians = math.radians(hour_angle_degrees)
+    cosine_zenith = (
+        math.sin(latitude_radians) * math.sin(solar_declination_radians)
+        + math.cos(latitude_radians)
+        * math.cos(solar_declination_radians)
+        * math.cos(hour_angle_radians)
+    )
+    zenith_degrees = math.degrees(math.acos(max(-1.0, min(1.0, cosine_zenith))))
+    elevation_degrees = 90 - zenith_degrees
+    azimuth_degrees = (
+        math.degrees(
+            math.atan2(
+                math.sin(hour_angle_radians),
+                math.cos(hour_angle_radians) * math.sin(latitude_radians)
+                - math.tan(solar_declination_radians) * math.cos(latitude_radians),
+            )
+        )
+        + 180
+    ) % 360
+
+    return {
+        "available": True,
+        "calculated_at": local_time.isoformat(),
+        "time_zone": str(time_zone_name or "UTC"),
+        "azimuth_degrees": round(azimuth_degrees, 2),
+        "elevation_degrees": round(elevation_degrees, 2),
+        "zenith_degrees": round(zenith_degrees, 2),
+        "hour_angle_degrees": round(hour_angle_degrees, 2),
+        "declination_degrees": round(math.degrees(solar_declination_radians), 2),
+        "equation_of_time_minutes": round(equation_of_time_minutes, 2),
+        "above_horizon": elevation_degrees > 0,
+        "method": "noaa-geometric-v1",
+    }
+
+
 def _intensity_level(ghi_value: float, is_daylight: bool) -> str:
     if not is_daylight or ghi_value < 50:
         return "low"
@@ -2082,8 +2170,8 @@ def _build_open_meteo_payload(
             "timezone": time_zone_name or "UTC",
             "past_hours": 2,
             "forecast_hours": 24,
-            "current": "is_day,shortwave_radiation,direct_normal_irradiance",
-            "hourly": "shortwave_radiation,direct_normal_irradiance",
+            "current": "is_day,cloud_cover,shortwave_radiation,direct_normal_irradiance",
+            "hourly": "cloud_cover,shortwave_radiation,direct_normal_irradiance",
         },
         ttl_seconds=600,
         force_refresh=force_refresh,
@@ -2133,11 +2221,19 @@ def get_surface_irradiance_snapshot(
     hourly_times = list(hourly.get("time") or [])
     hourly_ghi = [_safe_float(value) for value in (hourly.get("shortwave_radiation") or [])]
     hourly_dni = [_safe_float(value) for value in (hourly.get("direct_normal_irradiance") or [])]
+    hourly_cloud_cover = [_safe_float(value) for value in (hourly.get("cloud_cover") or [])]
     current_time = current.get("time")
     current_index = _find_hour_index(hourly_times, current_time)
     is_daylight = bool(current.get("is_day"))
     current_ghi = round(_safe_float(current.get("shortwave_radiation")), 1)
     current_dni = round(_safe_float(current.get("direct_normal_irradiance")), 1)
+    current_cloud_cover = round(_safe_float(current.get("cloud_cover")), 1)
+    solar_position = _calculate_solar_position(
+        latitude,
+        longitude,
+        current_time,
+        forecast_payload.get("timezone") or time_zone_name or "UTC",
+    )
     previous_hour_ghi = round(hourly_ghi[current_index - 1], 1) if current_index > 0 else None
     next_hour_ghi = round(hourly_ghi[current_index + 1], 1) if current_index + 1 < len(hourly_ghi) else None
     change_from_previous_hour = (
@@ -2148,6 +2244,7 @@ def get_surface_irradiance_snapshot(
     future_times = hourly_times[current_index:] or hourly_times
     future_ghi = hourly_ghi[current_index:] or hourly_ghi
     future_dni = hourly_dni[current_index:] or hourly_dni
+    future_cloud_cover = hourly_cloud_cover[current_index:] or hourly_cloud_cover
 
     peak_index = 0
     if future_ghi:
@@ -2178,6 +2275,11 @@ def get_surface_irradiance_snapshot(
                 "time": time_value,
                 "ghi_w_m2": round(future_ghi[index], 1),
                 "dni_w_m2": round(future_dni[index], 1),
+                "cloud_cover_percent": (
+                    round(future_cloud_cover[index], 1)
+                    if index < len(future_cloud_cover)
+                    else None
+                ),
             }
         )
 
@@ -2230,8 +2332,10 @@ def get_surface_irradiance_snapshot(
         "current": {
             "ghi_w_m2": current_ghi,
             "dni_w_m2": current_dni,
+            "cloud_cover_percent": current_cloud_cover,
             "intensity_level": intensity_level,
         },
+        "solar_position": solar_position,
         "trend": {
             "previous_hour_ghi_w_m2": previous_hour_ghi,
             "change_from_previous_hour_w_m2": change_from_previous_hour,

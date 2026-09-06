@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel
@@ -3335,6 +3335,128 @@ def get_surface_irradiance(coordinates: Coordinates):
     except Exception as exc:
         logger.error("Surface irradiance processing failed: %s", str(exc))
         raise HTTPException(status_code=500, detail="Unable to process surface irradiance data")
+
+
+@app.get(
+    "/api/home-assistant/snapshot",
+    response_model=dict,
+    summary="Get Home Assistant Snapshot",
+    description=(
+        "Returns a compact, read-only surface-irradiance and space-weather snapshot "
+        "for Home Assistant REST sensors."
+    ),
+)
+def get_home_assistant_snapshot(
+    latitude: float = Query(..., ge=-90, le=90),
+    longitude: float = Query(..., ge=-180, le=180),
+    guid: Optional[str] = None,
+    force_refresh: bool = False,
+):
+    time_zone = get_timezone(latitude, longitude) or "UTC"
+    property_context = None
+    if guid:
+        property_record = get_property_record(guid)
+        if property_record:
+            property_context = property_record.get("property_context")
+
+    components = {}
+    errors = {}
+    irradiance = None
+    space_weather = None
+
+    try:
+        irradiance = get_surface_irradiance_snapshot(
+            latitude,
+            longitude,
+            time_zone,
+            force_refresh=force_refresh,
+            property_context=property_context,
+        )
+        components["surface_irradiance"] = "available"
+    except Exception as exc:
+        logger.warning("Home Assistant irradiance snapshot unavailable: %s", str(exc))
+        components["surface_irradiance"] = "unavailable"
+        errors["surface_irradiance"] = "Unable to load surface irradiance data"
+
+    try:
+        space_weather = get_space_weather_snapshot(
+            latitude,
+            longitude,
+            time_zone,
+            force_refresh=force_refresh,
+        )
+        components["space_weather"] = "available"
+    except Exception as exc:
+        logger.warning("Home Assistant space-weather snapshot unavailable: %s", str(exc))
+        components["space_weather"] = "unavailable"
+        errors["space_weather"] = "Unable to load space weather data"
+
+    available_count = sum(value == "available" for value in components.values())
+    status = "ok" if available_count == 2 else "partial" if available_count else "unavailable"
+
+    irradiance_current = (irradiance or {}).get("current") or {}
+    irradiance_peak = (irradiance or {}).get("next_peak") or {}
+    solar_position = (irradiance or {}).get("solar_position") or {}
+    irradiance_freshness = (irradiance or {}).get("freshness") or {}
+    weather_global = (space_weather or {}).get("global") or {}
+    weather_local = (space_weather or {}).get("local") or {}
+    weather_freshness = (space_weather or {}).get("freshness") or {}
+
+    return {
+        "status": status,
+        "available": available_count > 0,
+        "observed_at": (irradiance or {}).get("observed_at")
+        or (space_weather or {}).get("observed_at"),
+        "location": {
+            "latitude": round(latitude, 6),
+            "longitude": round(longitude, 6),
+            "time_zone": time_zone,
+        },
+        "surface_irradiance": {
+            "available": irradiance is not None,
+            "observed_at": (irradiance or {}).get("observed_at"),
+            "is_daylight": (irradiance or {}).get("is_daylight"),
+            "ghi_w_m2": irradiance_current.get("ghi_w_m2"),
+            "dni_w_m2": irradiance_current.get("dni_w_m2"),
+            "cloud_cover_percent": irradiance_current.get("cloud_cover_percent"),
+            "intensity_level": irradiance_current.get("intensity_level"),
+            "spike_level": (irradiance or {}).get("spike_level"),
+            "next_peak_time": irradiance_peak.get("time"),
+            "next_peak_ghi_w_m2": irradiance_peak.get("ghi_w_m2"),
+            "summary": (irradiance or {}).get("summary"),
+            "freshness_status": irradiance_freshness.get("status"),
+        },
+        "sun_position": {
+            "available": bool(solar_position.get("available")),
+            "calculated_at": solar_position.get("calculated_at"),
+            "azimuth_degrees": solar_position.get("azimuth_degrees"),
+            "elevation_degrees": solar_position.get("elevation_degrees"),
+            "zenith_degrees": solar_position.get("zenith_degrees"),
+            "hour_angle_degrees": solar_position.get("hour_angle_degrees"),
+            "declination_degrees": solar_position.get("declination_degrees"),
+            "above_horizon": solar_position.get("above_horizon"),
+            "method": solar_position.get("method"),
+        },
+        "space_weather": {
+            "available": space_weather is not None,
+            "observed_at": (space_weather or {}).get("observed_at"),
+            "alert_level": (space_weather or {}).get("alert_level"),
+            "radio_blackout_scale": (weather_global.get("radio_blackout_scale") or {}).get("scale"),
+            "radiation_storm_scale": (weather_global.get("radiation_storm_scale") or {}).get("scale"),
+            "geomagnetic_storm_scale": (weather_global.get("geomagnetic_storm_scale") or {}).get("scale"),
+            "solar_wind_speed_km_s": (weather_global.get("solar_wind") or {}).get("speed_km_s"),
+            "aurora_visibility_potential": weather_local.get("aurora_visibility_potential"),
+            "hf_radio_risk": weather_local.get("hf_radio_risk"),
+            "gnss_risk": weather_local.get("gnss_risk"),
+            "alert_count": (space_weather or {}).get("alert_count"),
+            "watch_count": (space_weather or {}).get("watch_count"),
+            "warning_count": (space_weather or {}).get("warning_count"),
+            "summary": (space_weather or {}).get("summary"),
+            "freshness_status": weather_freshness.get("status"),
+        },
+        "components": components,
+        "errors": errors,
+    }
 
 
 @app.post(

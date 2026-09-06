@@ -1,0 +1,135 @@
+# Add the complete backend URL, including private coordinates, to secrets.yaml:
+# solar_buddy_snapshot_url: "http://127.0.0.1:18031/api/home-assistant/snapshot?latitude=YOUR_LATITUDE&longitude=YOUR_LONGITUDE"
+
+rest:
+  - resource: !secret solar_buddy_snapshot_url
+    scan_interval: 300
+    timeout: 30
+    sensor:
+      - name: Solar Buddy API
+        unique_id: solar_buddy_api
+        value_template: "{{ value_json.status }}"
+        json_attributes:
+          - observed_at
+          - location
+          - surface_irradiance
+          - sun_position
+          - space_weather
+          - components
+          - errors
+
+template:
+  - sensor:
+      - name: Solar Buddy Global Horizontal Irradiance
+        unique_id: solar_buddy_global_horizontal_irradiance
+        device_class: irradiance
+        state_class: measurement
+        unit_of_measurement: "W/m²"
+        availability: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'surface_irradiance') %}
+          {{ value is mapping and value.get('available') and value.get('ghi_w_m2') is not none }}
+        state: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'surface_irradiance') %}
+          {{ value.get('ghi_w_m2') if value is mapping else none }}
+
+      - name: Solar Buddy Direct Normal Irradiance
+        unique_id: solar_buddy_direct_normal_irradiance
+        device_class: irradiance
+        state_class: measurement
+        unit_of_measurement: "W/m²"
+        availability: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'surface_irradiance') %}
+          {{ value is mapping and value.get('available') and value.get('dni_w_m2') is not none }}
+        state: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'surface_irradiance') %}
+          {{ value.get('dni_w_m2') if value is mapping else none }}
+
+      - name: Solar Buddy Cloud Cover
+        unique_id: solar_buddy_cloud_cover
+        state_class: measurement
+        unit_of_measurement: "%"
+        icon: mdi:cloud-percent
+        availability: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'surface_irradiance') %}
+          {{ value is mapping and value.get('available') and value.get('cloud_cover_percent') is not none }}
+        state: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'surface_irradiance') %}
+          {{ value.get('cloud_cover_percent') if value is mapping else none }}
+
+      - name: Solar Buddy Sun Azimuth
+        unique_id: solar_buddy_sun_azimuth
+        state_class: measurement
+        unit_of_measurement: "°"
+        icon: mdi:sun-compass
+        availability: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'sun_position') %}
+          {{ value is mapping and value.get('available') and value.get('azimuth_degrees') is not none }}
+        state: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'sun_position') %}
+          {{ value.get('azimuth_degrees') if value is mapping else none }}
+
+      - name: Solar Buddy Sun Elevation
+        unique_id: solar_buddy_sun_elevation
+        state_class: measurement
+        unit_of_measurement: "°"
+        icon: mdi:angle-acute
+        availability: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'sun_position') %}
+          {{ value is mapping and value.get('available') and value.get('elevation_degrees') is not none }}
+        state: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'sun_position') %}
+          {{ value.get('elevation_degrees') if value is mapping else none }}
+
+      - name: Solar Buddy Sun Zenith
+        unique_id: solar_buddy_sun_zenith
+        state_class: measurement
+        unit_of_measurement: "°"
+        icon: mdi:angle-obtuse
+        availability: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'sun_position') %}
+          {{ value is mapping and value.get('available') and value.get('zenith_degrees') is not none }}
+        state: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'sun_position') %}
+          {{ value.get('zenith_degrees') if value is mapping else none }}
+
+      - name: Solar Buddy Space Weather Alert
+        unique_id: solar_buddy_space_weather_alert
+        availability: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'space_weather') %}
+          {{ value is mapping and value.get('available') and value.get('alert_level') is not none }}
+        state: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'space_weather') %}
+          {{ value.get('alert_level') if value is mapping else none }}
+        attributes:
+          summary: >-
+            {% set value = state_attr('sensor.solar_buddy_api', 'space_weather') %}
+            {{ value.get('summary') if value is mapping else none }}
+          hf_radio_risk: >-
+            {% set value = state_attr('sensor.solar_buddy_api', 'space_weather') %}
+            {{ value.get('hf_radio_risk') if value is mapping else none }}
+          gnss_risk: >-
+            {% set value = state_attr('sensor.solar_buddy_api', 'space_weather') %}
+            {{ value.get('gnss_risk') if value is mapping else none }}
+          aurora_visibility_potential: >-
+            {% set value = state_attr('sensor.solar_buddy_api', 'space_weather') %}
+            {{ value.get('aurora_visibility_potential') if value is mapping else none }}
+
+      - name: Solar Buddy Geomagnetic Storm Scale
+        unique_id: solar_buddy_geomagnetic_storm_scale
+        state_class: measurement
+        availability: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'space_weather') %}
+          {{ value is mapping and value.get('available') and value.get('geomagnetic_storm_scale') is not none }}
+        state: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'space_weather') %}
+          {{ value.get('geomagnetic_storm_scale') if value is mapping else none }}
+
+  - binary_sensor:
+      - name: Solar Buddy Daylight
+        unique_id: solar_buddy_daylight
+        availability: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'surface_irradiance') %}
+          {{ value is mapping and value.get('available') and value.get('is_daylight') is not none }}
+        state: >-
+          {% set value = state_attr('sensor.solar_buddy_api', 'surface_irradiance') %}
+          {{ value.get('is_daylight') if value is mapping else false }}
