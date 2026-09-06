@@ -1,5 +1,5 @@
-# Add the complete backend URL, including private coordinates, to secrets.yaml:
-# solar_buddy_snapshot_url: "http://127.0.0.1:18031/api/home-assistant/snapshot?latitude=YOUR_LATITUDE&longitude=YOUR_LONGITUDE"
+# Add the complete Home Assistant-reachable backend URL, including private coordinates, to secrets.yaml:
+# solar_buddy_snapshot_url: "https://APPROVED_SOLAR_API_HOST/api/home-assistant/snapshot?latitude=YOUR_LATITUDE&longitude=YOUR_LONGITUDE"
 
 rest:
   - resource: !secret solar_buddy_snapshot_url

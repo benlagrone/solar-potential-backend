@@ -12,17 +12,22 @@ requested coordinates. It does not expose device-control, automation, property-r
 irrigation routes. If one upstream feed fails, the endpoint returns `status: partial` and preserves
 the other component.
 
-## Recommended Fortress Runtime Path
+## Fortress Runtime Boundary
 
-During the locked interim both services run on `fortress-phronesis`. Home Assistant uses host
-networking and the Solar Buddy backend binds to loopback port `18031`, so the private consumer URL
-is:
+Solar Buddy currently binds to loopback port `18031` on its Fortress deployment host. Home
+Assistant currently runs on `fortress.sextant`, so `127.0.0.1:18031` inside Home Assistant does not
+reach Solar Buddy. Do not install the package with that loopback URL.
+
+Set `solar_buddy_snapshot_url` only after the workspace deployment capability provides an approved
+route that is reachable from Sextant, for example:
 
 ```text
-http://127.0.0.1:18031/api/home-assistant/snapshot?latitude=<latitude>&longitude=<longitude>
+https://<approved-solar-api-host>/api/home-assistant/snapshot?latitude=<latitude>&longitude=<longitude>
 ```
 
-This keeps the property's coordinates out of public URLs and does not require an API credential.
+If the approved route requires authentication, keep the credential in Home Assistant secrets and
+add the corresponding server-side header configuration. Do not place private coordinates or
+credentials in the committed package.
 
 ## Configuration
 
@@ -47,11 +52,11 @@ Do not put private coordinates in a committed package. Keep them in Home Assista
 
 ## Smoke Check
 
-From the Home Assistant host:
+From the Home Assistant host, using the approved reachable route:
 
 ```bash
 curl --fail --silent --show-error \
-  'http://127.0.0.1:18031/api/home-assistant/snapshot?latitude=<latitude>&longitude=<longitude>'
+  'https://<approved-solar-api-host>/api/home-assistant/snapshot?latitude=<latitude>&longitude=<longitude>'
 ```
 
 Confirm that `status` is `ok` or `partial`, then confirm the `sensor.solar_buddy_api` entity and
