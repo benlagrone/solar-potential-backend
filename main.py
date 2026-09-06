@@ -1,10 +1,11 @@
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import logging
+import hmac
 import math
 import os
 from data_persistence import (
@@ -3351,7 +3352,15 @@ def get_home_assistant_snapshot(
     longitude: float = Query(..., ge=-180, le=180),
     guid: Optional[str] = None,
     force_refresh: bool = False,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
 ):
+    configured_api_key = os.getenv("HOME_ASSISTANT_API_KEY", "").strip()
+    if not configured_api_key:
+        logger.error("Home Assistant API access is disabled because HOME_ASSISTANT_API_KEY is not configured")
+        raise HTTPException(status_code=503, detail="Home Assistant API access is not configured")
+    if not x_api_key or not hmac.compare_digest(x_api_key, configured_api_key):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
     time_zone = get_timezone(latitude, longitude) or "UTC"
     property_context = None
     if guid:

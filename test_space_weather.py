@@ -510,10 +510,12 @@ class SpaceWeatherEndpointTests(unittest.TestCase):
         _space_weather_snapshot,
         _timezone,
     ):
-        response = self.client.get(
-            "/api/home-assistant/snapshot",
-            params={"latitude": 30.2672, "longitude": -97.7431},
-        )
+        with patch.dict(main.os.environ, {"HOME_ASSISTANT_API_KEY": "test-home-assistant-key"}):
+            response = self.client.get(
+                "/api/home-assistant/snapshot",
+                params={"latitude": 30.2672, "longitude": -97.7431},
+                headers={"X-API-Key": "test-home-assistant-key"},
+            )
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -540,10 +542,12 @@ class SpaceWeatherEndpointTests(unittest.TestCase):
         _space_weather_snapshot,
         _timezone,
     ):
-        response = self.client.get(
-            "/api/home-assistant/snapshot",
-            params={"latitude": 30.2672, "longitude": -97.7431},
-        )
+        with patch.dict(main.os.environ, {"HOME_ASSISTANT_API_KEY": "test-home-assistant-key"}):
+            response = self.client.get(
+                "/api/home-assistant/snapshot",
+                params={"latitude": 30.2672, "longitude": -97.7431},
+                headers={"X-API-Key": "test-home-assistant-key"},
+            )
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -561,6 +565,43 @@ class SpaceWeatherEndpointTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 422)
+
+    @patch.object(main, "get_timezone")
+    def test_home_assistant_snapshot_rejects_missing_api_key(self, mocked_timezone):
+        with patch.dict(main.os.environ, {"HOME_ASSISTANT_API_KEY": "test-home-assistant-key"}):
+            response = self.client.get(
+                "/api/home-assistant/snapshot",
+                params={"latitude": 30.2672, "longitude": -97.7431},
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["detail"], "Invalid API key")
+        mocked_timezone.assert_not_called()
+
+    @patch.object(main, "get_timezone")
+    def test_home_assistant_snapshot_rejects_invalid_api_key(self, mocked_timezone):
+        with patch.dict(main.os.environ, {"HOME_ASSISTANT_API_KEY": "test-home-assistant-key"}):
+            response = self.client.get(
+                "/api/home-assistant/snapshot",
+                params={"latitude": 30.2672, "longitude": -97.7431},
+                headers={"X-API-Key": "wrong-key"},
+            )
+
+        self.assertEqual(response.status_code, 401)
+        mocked_timezone.assert_not_called()
+
+    @patch.object(main, "get_timezone")
+    def test_home_assistant_snapshot_fails_closed_without_server_key(self, mocked_timezone):
+        with patch.dict(main.os.environ, {}, clear=True):
+            response = self.client.get(
+                "/api/home-assistant/snapshot",
+                params={"latitude": 30.2672, "longitude": -97.7431},
+                headers={"X-API-Key": "any-key"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Home Assistant API access is not configured")
+        mocked_timezone.assert_not_called()
 
     @patch.object(main, "get_timezone", return_value="America/Chicago")
     def test_space_weather_history_endpoint_returns_recent_donki_timeline(self, _timezone):

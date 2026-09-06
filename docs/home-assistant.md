@@ -12,6 +12,10 @@ requested coordinates. It does not expose device-control, automation, property-r
 irrigation routes. If one upstream feed fails, the endpoint returns `status: partial` and preserves
 the other component.
 
+Every request must include the dedicated API key in the `X-API-Key` header. A missing or incorrect
+key returns HTTP `401`. If the backend has no `HOME_ASSISTANT_API_KEY` configured, it fails closed
+with HTTP `503`.
+
 ## Fortress Runtime Boundary
 
 Solar Buddy currently binds to loopback port `18031` on its Fortress deployment host. Home
@@ -25,15 +29,14 @@ route that is reachable from Sextant, for example:
 https://<approved-solar-api-host>/api/home-assistant/snapshot?latitude=<latitude>&longitude=<longitude>
 ```
 
-If the approved route requires authentication, keep the credential in Home Assistant secrets and
-add the corresponding server-side header configuration. Do not place private coordinates or
-credentials in the committed package.
+Keep the credential in Home Assistant secrets and the corresponding backend deployment secret. Do
+not place private coordinates or credentials in the committed package.
 
 ## Configuration
 
 1. Copy `docs/home-assistant-package.yaml.example` into the Home Assistant packages directory.
 2. Put the full URL in Home Assistant's uncommitted `secrets.yaml` as
-   `solar_buddy_snapshot_url`.
+   `solar_buddy_snapshot_url`, and put the dedicated key there as `solar_buddy_api_key`.
 3. Ensure `configuration.yaml` loads that packages directory.
 4. Run Home Assistant's configuration check, then restart Home Assistant.
 
@@ -56,6 +59,7 @@ From the Home Assistant host, using the approved reachable route:
 
 ```bash
 curl --fail --silent --show-error \
+  --header 'X-API-Key: <HOME_ASSISTANT_API_KEY>' \
   'https://<approved-solar-api-host>/api/home-assistant/snapshot?latitude=<latitude>&longitude=<longitude>'
 ```
 

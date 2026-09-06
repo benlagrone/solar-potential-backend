@@ -1,8 +1,11 @@
 # Add the complete Home Assistant-reachable backend URL, including private coordinates, to secrets.yaml:
 # solar_buddy_snapshot_url: "https://APPROVED_SOLAR_API_HOST/api/home-assistant/snapshot?latitude=YOUR_LATITUDE&longitude=YOUR_LONGITUDE"
+# solar_buddy_api_key: "YOUR_DEDICATED_API_KEY"
 
 rest:
   - resource: !secret solar_buddy_snapshot_url
+    headers:
+      X-API-Key: !secret solar_buddy_api_key
     scan_interval: 300
     timeout: 30
     sensor:
